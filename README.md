@@ -27,6 +27,8 @@ python gemini_live_computer_use.py
 
 The Live client is interactive: it keeps listening after tool calls and
 reconnects automatically if the Live receive stream ends.
+The default worker timeout is 180 seconds so drone photo commands have time to
+take off, capture images, summarize them, and land.
 
 For Vertex AI, use Google Cloud application-default credentials. The Vertex AI
 Live endpoint does not accept API keys for these calls:
@@ -99,6 +101,8 @@ Use the browser to summarize the current page.
 Use the browser to take a screenshot.
 Run the drone simple program.
 Run simple.py on the drone.
+What do you see?
+Look around and tell me what you see.
 ```
 
 You can swap in another worker program:
@@ -133,3 +137,14 @@ Drone commands are also allowlisted in `computer_worker.py`. To test the
 ```bash
 python computer_worker.py --command drone_run_simple --payload '{"timeout_seconds":60}'
 ```
+
+To test the 360-degree visual summary handoff directly:
+
+```bash
+python computer_worker.py --command drone_look_around --payload '{"timeout_seconds":120}'
+```
+
+Each look-around run stores its photos in a fresh `drone_captures/<session-id>/`
+directory, so summaries only use images from the current run.
+If all four photos are captured but the final cleanup rotation fails, the worker
+still summarizes the current session photos and returns a warning.

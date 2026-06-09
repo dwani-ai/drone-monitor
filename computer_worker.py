@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -28,13 +29,23 @@ SUPPORTED_COMMANDS = [
     "browser_type_text",
     "browser_screenshot",
     "drone_run_simple",
+    "drone_look_around",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent
 BROWSER_DIR = REPO_ROOT / ".computer_use_browser"
 STATE_PATH = BROWSER_DIR / "state.json"
 SCREENSHOT_PATH = BROWSER_DIR / "screenshot.png"
+DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 SIMPLE_DRONE_PROGRAM = REPO_ROOT / "simple.py"
+PHOTO_DRONE_PROGRAM = REPO_ROOT / "360_photo.py"
+PHOTO_FILENAMES = [
+    "tello_photo_0_deg.jpg",
+    "tello_photo_90_deg.jpg",
+    "tello_photo_180_deg.jpg",
+    "tello_photo_270_deg.jpg",
+]
+VISION_MODEL_ID = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
 
 
 def parse_payload(payload: str) -> dict[str, Any]:
@@ -263,6 +274,149 @@ def run_simple_drone_program(payload: str) -> dict[str, Any]:
     }
 
 
+def create_genai_client() -> Any:
+    """Create a Gemini client for summarizing drone photos."""
+    from google import genai
+
+    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+    location = (
+        os.getenv("GOOGLE_CLOUD_LOCATION")
+        or os.getenv("GOOGLE_CLOUD_REGION")
+        or os.getenv("GOOGLE_CLOUD_DEFAULT_REGION")
+    )
+    if project and location:
+        return genai.Client(vertexai=True, project=project, location=location)
+
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if api_key:
+        return genai.Client(api_key=api_key)
+
+    raise RuntimeError(
+        "Gemini vision summary needs Vertex project/location env vars or GEMINI_API_KEY."
+    )
+
+
+def summarize_drone_photos(image_paths: list[Path]) -> str:
+    """Ask Gemini for a one-line summary of the captured 360-degree photos."""
+    from google.genai import types
+
+    client = create_genai_client()
+    contents: list[Any] = [
+        (
+            "These are four photos captured by a drone while rotating 360 degrees. "
+            "In one short spoken sentence, answer: what do you see?"
+        )
+    ]
+    contents.extend(
+        types.Part.from_bytes(data=image_path.read_bytes(), mime_type="image/jpeg")
+        for image_path in image_paths
+    )
+
+    response = client.models.generate_content(
+        model=VISION_MODEL_ID,
+        contents=contents,
+    )
+    summary = (response.text or "").strip()
+    if not summary:
+        raise RuntimeError("Gemini returned an empty image summary.")
+
+    return " ".join(summary.split())
+
+
+def run_look_around(payload: str) -> dict[str, Any]:
+    """Capture four drone photos with 360_photo.py and summarize them."""
+    data = parse_payload(payload)
+    timeout_seconds = float(data.get("timeout_seconds", 120))
+    session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    capture_dir = DRONE_CAPTURE_DIR / session_id
+    photo_paths = [capture_dir / filename for filename in PHOTO_FILENAMES]
+
+    if not PHOTO_DRONE_PROGRAM.exists():
+        return {
+            "status": "error",
+            "message": f"Drone photo program not found: {PHOTO_DRONE_PROGRAM}",
+        }
+
+    capture_dir.mkdir(parents=True, exist_ok=False)
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(PHOTO_DRONE_PROGRAM), "--output-dir", str(capture_dir)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "error",
+            "message": f"360_photo.py timed out after {timeout_seconds}s",
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+    except OSError as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
+
+    missing_images = [str(path) for path in photo_paths if not path.exists()]
+    if completed.returncode != 0 and missing_images:
+        return {
+            "status": "error",
+            "message": "360_photo.py failed before all expected photos were captured.",
+            "program": str(PHOTO_DRONE_PROGRAM),
+            "returncode": completed.returncode,
+            "session_id": session_id,
+            "capture_dir": str(capture_dir),
+            "missing_images": missing_images,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+
+    if missing_images:
+        return {
+            "status": "error",
+            "message": "360_photo.py completed but expected photos are missing.",
+            "session_id": session_id,
+            "capture_dir": str(capture_dir),
+            "missing_images": missing_images,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+
+    try:
+        summary = summarize_drone_photos(photo_paths)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to summarize drone photos: {exc}",
+            "session_id": session_id,
+            "capture_dir": str(capture_dir),
+            "images": [str(path) for path in photo_paths],
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+
+    return {
+        "status": "ok",
+        "warning": (
+            "360_photo.py exited nonzero after capturing all photos; summarized "
+            "available session images."
+            if completed.returncode != 0
+            else ""
+        ),
+        "program_returncode": completed.returncode,
+        "session_id": session_id,
+        "capture_dir": str(capture_dir),
+        "summary": summary,
+        "images": [str(path) for path in photo_paths],
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+    }
+
+
 def handle_command(command: str, payload: str) -> dict[str, Any]:
     """Run one allowlisted command and return JSON-serializable output."""
     if command == "status":
@@ -294,6 +448,9 @@ def handle_command(command: str, payload: str) -> dict[str, Any]:
 
     if command == "drone_run_simple":
         return run_simple_drone_program(payload)
+
+    if command == "drone_look_around":
+        return run_look_around(payload)
 
     return {
         "status": "error",

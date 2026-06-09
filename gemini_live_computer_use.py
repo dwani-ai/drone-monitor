@@ -47,8 +47,13 @@ def run_computer_program(
     payload: str,
     program_path: Path,
     timeout_seconds: float,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Call the separate Python program used for computer actions."""
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
     try:
         completed = subprocess.run(
             [
@@ -64,6 +69,7 @@ def run_computer_program(
             text=True,
             timeout=timeout_seconds,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -79,18 +85,27 @@ def run_computer_program(
         }
 
     stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    parsed_stdout: Any | None = None
+    if stdout:
+        try:
+            parsed_stdout = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed_stdout = None
+
+    if isinstance(parsed_stdout, dict):
+        return {
+            **parsed_stdout,
+            "worker_returncode": completed.returncode,
+            "worker_stderr": stderr,
+        }
+
     response: dict[str, Any] = {
         "status": "ok" if completed.returncode == 0 else "error",
         "returncode": completed.returncode,
         "stdout": stdout,
-        "stderr": completed.stderr.strip(),
+        "stderr": stderr,
     }
-
-    if stdout:
-        try:
-            response["json"] = json.loads(stdout)
-        except json.JSONDecodeError:
-            pass
 
     return response
 
@@ -165,6 +180,19 @@ def resolve_model(args: argparse.Namespace) -> str:
     return DEVELOPER_MODEL_ID
 
 
+def build_worker_env(args: argparse.Namespace) -> dict[str, str]:
+    worker_env: dict[str, str] = {}
+    if args.vertexai:
+        project = get_vertex_project(args)
+        location = get_vertex_location(args)
+        if project:
+            worker_env["GOOGLE_CLOUD_PROJECT"] = project
+        if location:
+            worker_env["GOOGLE_CLOUD_LOCATION"] = location
+
+    return worker_env
+
+
 def get_supported_methods(model: Any) -> list[str]:
     methods = (
         getattr(model, "supported_generation_methods", None)
@@ -211,7 +239,7 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "Worker command to run. Supported commands are status, echo, "
                         "list_repo_files, browser_open_url, browser_search, "
                         "browser_get_text, browser_click_text, browser_type_text, "
-                        "browser_screenshot, and drone_run_simple."
+                        "browser_screenshot, drone_run_simple, and drone_look_around."
                     ),
                 },
                 "payload": {
@@ -223,7 +251,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "{\"text\":\"More details\"}, or "
                         "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
                         "\"submit\":true}. For drone_run_simple, optional JSON is "
-                        "{\"timeout_seconds\":60}."
+                        "{\"timeout_seconds\":60}. For drone_look_around, optional "
+                        "JSON is {\"timeout_seconds\":120}."
                     ),
                 },
             },
@@ -241,6 +270,9 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "payloads. Do not request arbitrary shell commands. "
             "When the user asks to run the drone simple program or simple.py, "
             "call run_computer_program with command drone_run_simple. "
+            "When the user asks 'what do you see?' or asks the drone to look "
+            "around, call run_computer_program with command drone_look_around, "
+            "then speak the returned one-line summary directly. "
             "Keep spoken responses short and confirm tool results clearly. "
             "After each tool result, continue listening for the user's next request."
         ),
@@ -289,56 +321,65 @@ async def receive_live_messages(
     speaker_queue: asyncio.Queue[bytes],
     program_path: Path,
     timeout_seconds: float,
+    worker_env: dict[str, str],
     stop_event: asyncio.Event,
 ) -> None:
     """Handle audio, text, and tool-call messages from Gemini Live."""
-    async for message in session.receive():
-        if stop_event.is_set():
-            break
+    while not stop_event.is_set():
+        saw_message = False
 
-        if getattr(message, "data", None):
-            await speaker_queue.put(message.data)
+        async for message in session.receive():
+            saw_message = True
+            if stop_event.is_set():
+                break
 
-        if getattr(message, "text", None):
-            print(message.text, end="", flush=True)
+            if getattr(message, "data", None):
+                await speaker_queue.put(message.data)
 
-        tool_call = getattr(message, "tool_call", None)
-        if not tool_call:
-            continue
+            if getattr(message, "text", None):
+                print(message.text, end="", flush=True)
 
-        function_responses = []
-        for function_call in tool_call.function_calls:
-            args = dict(function_call.args or {})
-            command = str(args.get("command", "status"))
-            payload = str(args.get("payload", ""))
-            print(f"\nTool call: {function_call.name}({args})")
+            tool_call = getattr(message, "tool_call", None)
+            if not tool_call:
+                continue
 
-            if function_call.name != "run_computer_program":
-                result = {
-                    "status": "error",
-                    "message": f"Unknown tool: {function_call.name}",
-                }
-            else:
-                result = run_computer_program(
-                    command=command,
-                    payload=payload,
-                    program_path=program_path,
-                    timeout_seconds=timeout_seconds,
+            function_responses = []
+            for function_call in tool_call.function_calls:
+                args = dict(function_call.args or {})
+                command = str(args.get("command", "status"))
+                payload = str(args.get("payload", ""))
+                print(f"\nTool call: {function_call.name}({args})")
+
+                if function_call.name != "run_computer_program":
+                    result = {
+                        "status": "error",
+                        "message": f"Unknown tool: {function_call.name}",
+                    }
+                else:
+                    result = run_computer_program(
+                        command=command,
+                        payload=payload,
+                        program_path=program_path,
+                        timeout_seconds=timeout_seconds,
+                        extra_env=worker_env,
+                    )
+
+                print(f"Tool result: {json.dumps(result)}")
+                function_responses.append(
+                    {
+                        "name": function_call.name,
+                        "id": function_call.id,
+                        "response": {"result": result},
+                    }
                 )
 
-            print(f"Tool result: {json.dumps(result)}")
-            function_responses.append(
-                {
-                    "name": function_call.name,
-                    "id": function_call.id,
-                    "response": {"result": result},
-                }
-            )
+            if function_responses:
+                await session.send_tool_response(function_responses=function_responses)
 
-        if function_responses:
-            await session.send_tool_response(function_responses=function_responses)
-
-    print("\nGemini Live receive stream ended.", file=sys.stderr)
+        if saw_message:
+            print("\nGemini Live turn ended. Continuing to listen...", file=sys.stderr)
+        else:
+            await asyncio.sleep(0.1)
 
 
 async def run_live_client(args: argparse.Namespace) -> None:
@@ -349,6 +390,7 @@ async def run_live_client(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Computer program not found: {program_path}")
 
     client = create_client(args)
+    worker_env = build_worker_env(args)
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
     speaker_queue: asyncio.Queue[bytes] = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -395,6 +437,7 @@ async def run_live_client(args: argparse.Namespace) -> None:
                                 speaker_queue=speaker_queue,
                                 program_path=program_path,
                                 timeout_seconds=args.timeout,
+                                worker_env=worker_env,
                                 stop_event=stop_event,
                             )
                         ),
@@ -464,7 +507,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
+        default=180.0,
         help="Seconds to wait for the external computer program.",
     )
     return parser.parse_args()

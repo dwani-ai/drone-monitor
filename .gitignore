@@ -181,3 +181,7 @@ cython_debug/
 
 # Local browser state and screenshots from computer_worker.py
 .computer_use_browser/
+
+# Drone camera captures
+tello_photo_*_deg.jpg
+drone_captures/
