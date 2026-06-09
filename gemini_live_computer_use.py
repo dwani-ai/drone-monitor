@@ -211,7 +211,7 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "Worker command to run. Supported commands are status, echo, "
                         "list_repo_files, browser_open_url, browser_search, "
                         "browser_get_text, browser_click_text, browser_type_text, "
-                        "and browser_screenshot."
+                        "browser_screenshot, and drone_run_simple."
                     ),
                 },
                 "payload": {
@@ -222,7 +222,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "{\"query\":\"drone safety checklist\"}, "
                         "{\"text\":\"More details\"}, or "
                         "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
-                        "\"submit\":true}."
+                        "\"submit\":true}. For drone_run_simple, optional JSON is "
+                        "{\"timeout_seconds\":60}."
                     ),
                 },
             },
@@ -238,6 +239,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "call run_computer_program instead of claiming you did it. "
             "For browser requests, use the browser_* worker commands with JSON "
             "payloads. Do not request arbitrary shell commands. "
+            "When the user asks to run the drone simple program or simple.py, "
+            "call run_computer_program with command drone_run_simple. "
             "Keep spoken responses short and confirm tool results clearly. "
             "After each tool result, continue listening for the user's next request."
         ),

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,12 +27,14 @@ SUPPORTED_COMMANDS = [
     "browser_click_text",
     "browser_type_text",
     "browser_screenshot",
+    "drone_run_simple",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent
 BROWSER_DIR = REPO_ROOT / ".computer_use_browser"
 STATE_PATH = BROWSER_DIR / "state.json"
 SCREENSHOT_PATH = BROWSER_DIR / "screenshot.png"
+SIMPLE_DRONE_PROGRAM = REPO_ROOT / "simple.py"
 
 
 def parse_payload(payload: str) -> dict[str, Any]:
@@ -217,6 +221,48 @@ def run_browser_action(command: str, payload: str) -> dict[str, Any]:
         }
 
 
+def run_simple_drone_program(payload: str) -> dict[str, Any]:
+    """Run the allowlisted simple.py drone program."""
+    data = parse_payload(payload)
+    timeout_seconds = float(data.get("timeout_seconds", 60))
+
+    if not SIMPLE_DRONE_PROGRAM.exists():
+        return {
+            "status": "error",
+            "message": f"Drone program not found: {SIMPLE_DRONE_PROGRAM}",
+        }
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(SIMPLE_DRONE_PROGRAM)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "error",
+            "message": f"simple.py timed out after {timeout_seconds}s",
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+    except OSError as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
+
+    return {
+        "status": "ok" if completed.returncode == 0 else "error",
+        "program": str(SIMPLE_DRONE_PROGRAM),
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+    }
+
+
 def handle_command(command: str, payload: str) -> dict[str, Any]:
     """Run one allowlisted command and return JSON-serializable output."""
     if command == "status":
@@ -245,6 +291,9 @@ def handle_command(command: str, payload: str) -> dict[str, Any]:
 
     if command.startswith("browser_"):
         return run_browser_action(command, payload)
+
+    if command == "drone_run_simple":
+        return run_simple_drone_program(payload)
 
     return {
         "status": "error",

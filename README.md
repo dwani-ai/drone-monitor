@@ -97,6 +97,8 @@ Use the browser to open example.com.
 Use the browser to search for Tello drone SDK docs.
 Use the browser to summarize the current page.
 Use the browser to take a screenshot.
+Run the drone simple program.
+Run simple.py on the drone.
 ```
 
 You can swap in another worker program:
@@ -124,3 +126,10 @@ python computer_worker.py --command browser_screenshot
 
 Set `COMPUTER_USE_HEADLESS=false` to force a visible browser window when a
 desktop display is available.
+
+Drone commands are also allowlisted in `computer_worker.py`. To test the
+`simple.py` handoff directly:
+
+```bash
+python computer_worker.py --command drone_run_simple --payload '{"timeout_seconds":60}'
+```
