@@ -238,7 +238,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "call run_computer_program instead of claiming you did it. "
             "For browser requests, use the browser_* worker commands with JSON "
             "payloads. Do not request arbitrary shell commands. "
-            "Keep spoken responses short and confirm tool results clearly."
+            "Keep spoken responses short and confirm tool results clearly. "
+            "After each tool result, continue listening for the user's next request."
         ),
     }
 
@@ -248,9 +249,13 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
     return config
 
 
-async def send_microphone_audio(session: Any, audio_queue: asyncio.Queue[bytes]) -> None:
+async def send_microphone_audio(
+    session: Any,
+    audio_queue: asyncio.Queue[bytes],
+    stop_event: asyncio.Event,
+) -> None:
     """Forward microphone PCM chunks to Gemini Live."""
-    while True:
+    while not stop_event.is_set():
         chunk = await audio_queue.get()
         await session.send_realtime_input(
             audio=types.Blob(
@@ -263,6 +268,7 @@ async def send_microphone_audio(session: Any, audio_queue: asyncio.Queue[bytes])
 async def play_model_audio(
     speaker_queue: asyncio.Queue[bytes],
     sd_module: Any,
+    stop_event: asyncio.Event,
 ) -> None:
     """Play Gemini Live PCM audio responses."""
     with sd_module.RawOutputStream(
@@ -270,7 +276,7 @@ async def play_model_audio(
         channels=CHANNELS,
         dtype=SAMPLE_DTYPE,
     ) as stream:
-        while True:
+        while not stop_event.is_set():
             chunk = await speaker_queue.get()
             stream.write(chunk)
 
@@ -280,9 +286,13 @@ async def receive_live_messages(
     speaker_queue: asyncio.Queue[bytes],
     program_path: Path,
     timeout_seconds: float,
+    stop_event: asyncio.Event,
 ) -> None:
     """Handle audio, text, and tool-call messages from Gemini Live."""
     async for message in session.receive():
+        if stop_event.is_set():
+            break
+
         if getattr(message, "data", None):
             await speaker_queue.put(message.data)
 
@@ -325,6 +335,8 @@ async def receive_live_messages(
         if function_responses:
             await session.send_tool_response(function_responses=function_responses)
 
+    print("\nGemini Live receive stream ended.", file=sys.stderr)
+
 
 async def run_live_client(args: argparse.Namespace) -> None:
     sd = load_sounddevice()
@@ -337,6 +349,7 @@ async def run_live_client(args: argparse.Namespace) -> None:
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
     speaker_queue: asyncio.Queue[bytes] = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    reconnect_delay = 2.0
 
     def microphone_callback(indata: bytes, frames: int, time: Any, status: Any) -> None:
         if status:
@@ -347,28 +360,64 @@ async def run_live_client(args: argparse.Namespace) -> None:
     print("Try: 'Use the computer to check status' or 'Use the computer to echo hello'.")
     print("Press Ctrl+C to stop.")
 
-    async with client.aio.live.connect(
-        model=resolve_model(args),
-        config=build_live_config(enable_tools=not args.disable_tools),
-    ) as session:
-        with sd.RawInputStream(
-            samplerate=INPUT_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=SAMPLE_DTYPE,
-            blocksize=CHUNK_SIZE,
-            callback=microphone_callback,
-        ):
-            async with asyncio.TaskGroup() as task_group:
-                task_group.create_task(send_microphone_audio(session, audio_queue))
-                task_group.create_task(play_model_audio(speaker_queue, sd))
-                task_group.create_task(
-                    receive_live_messages(
-                        session=session,
-                        speaker_queue=speaker_queue,
-                        program_path=program_path,
-                        timeout_seconds=args.timeout,
+    with sd.RawInputStream(
+        samplerate=INPUT_SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype=SAMPLE_DTYPE,
+        blocksize=CHUNK_SIZE,
+        callback=microphone_callback,
+    ):
+        while True:
+            stop_event = asyncio.Event()
+            while not audio_queue.empty():
+                audio_queue.get_nowait()
+            while not speaker_queue.empty():
+                speaker_queue.get_nowait()
+
+            try:
+                async with client.aio.live.connect(
+                    model=resolve_model(args),
+                    config=build_live_config(enable_tools=not args.disable_tools),
+                ) as session:
+                    print("Connected. Listening for requests...")
+
+                    tasks = [
+                        asyncio.create_task(
+                            send_microphone_audio(session, audio_queue, stop_event)
+                        ),
+                        asyncio.create_task(play_model_audio(speaker_queue, sd, stop_event)),
+                        asyncio.create_task(
+                            receive_live_messages(
+                                session=session,
+                                speaker_queue=speaker_queue,
+                                program_path=program_path,
+                                timeout_seconds=args.timeout,
+                                stop_event=stop_event,
+                            )
+                        ),
+                    ]
+
+                    done, pending = await asyncio.wait(
+                        tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                )
+                    stop_event.set()
+
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                    for task in done:
+                        task.result()
+            except asyncio.CancelledError:
+                raise
+            except errors.APIError:
+                raise
+            except Exception as exc:
+                print(f"\nLive session ended: {exc}", file=sys.stderr)
+
+            print(f"Reconnecting in {reconnect_delay:.0f}s...", file=sys.stderr)
+            await asyncio.sleep(reconnect_delay)
 
 
 def parse_args() -> argparse.Namespace:

@@ -25,6 +25,9 @@ Run the native-audio Live API client:
 python gemini_live_computer_use.py
 ```
 
+The Live client is interactive: it keeps listening after tool calls and
+reconnects automatically if the Live receive stream ends.
+
 For Vertex AI, use Google Cloud application-default credentials. The Vertex AI
 Live endpoint does not accept API keys for these calls:
 
