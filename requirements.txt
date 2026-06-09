@@ -2,3 +2,4 @@ djitellopy
 opencv-python
 google-genai
 sounddevice
+playwright

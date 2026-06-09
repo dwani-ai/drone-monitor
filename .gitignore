@@ -178,3 +178,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local browser state and screenshots from computer_worker.py
+.computer_use_browser/

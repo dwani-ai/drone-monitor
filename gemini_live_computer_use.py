@@ -199,7 +199,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
         "name": "run_computer_program",
         "description": (
             "Run an allowlisted command in a separate local Python program. "
-            "Use this for computer actions, drone helper actions, or local checks."
+            "Use this for computer actions, browser actions, drone helper actions, "
+            "or local checks. Browser payloads should be JSON strings."
         ),
         "parameters": {
             "type": "object",
@@ -207,13 +208,22 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                 "command": {
                     "type": "string",
                     "description": (
-                        "Worker command to run. Supported demo commands are "
-                        "status, echo, and list_repo_files."
+                        "Worker command to run. Supported commands are status, echo, "
+                        "list_repo_files, browser_open_url, browser_search, "
+                        "browser_get_text, browser_click_text, browser_type_text, "
+                        "and browser_screenshot."
                     ),
                 },
                 "payload": {
                     "type": "string",
-                    "description": "Optional text payload to pass to the worker.",
+                    "description": (
+                        "Optional text or JSON payload. Browser examples: "
+                        "{\"url\":\"https://example.com\"}, "
+                        "{\"query\":\"drone safety checklist\"}, "
+                        "{\"text\":\"More details\"}, or "
+                        "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
+                        "\"submit\":true}."
+                    ),
                 },
             },
             "required": ["command"],
@@ -226,6 +236,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "You are a voice assistant for a drone-monitor project. "
             "When the user asks you to use the computer or run a local helper, "
             "call run_computer_program instead of claiming you did it. "
+            "For browser requests, use the browser_* worker commands with JSON "
+            "payloads. Do not request arbitrary shell commands. "
             "Keep spoken responses short and confirm tool results clearly."
         ),
     }

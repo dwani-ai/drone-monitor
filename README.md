@@ -9,6 +9,8 @@ source venv/bin/activate
 
 pip install -r requirements.txt
 
+python -m playwright install chromium
+
 ## Gemini Live native audio
 
 For a Gemini Developer API key:
@@ -88,6 +90,10 @@ Try saying:
 Use the computer to check status.
 Use the computer to echo hello from Gemini.
 Use the computer to list repo files.
+Use the browser to open example.com.
+Use the browser to search for Tello drone SDK docs.
+Use the browser to summarize the current page.
+Use the browser to take a screenshot.
 ```
 
 You can swap in another worker program:
@@ -102,3 +108,16 @@ stdout. On Linux, `sounddevice` may require PortAudio, for example:
 ```bash
 sudo apt install portaudio19-dev
 ```
+
+Browser computer-use commands are allowlisted in `computer_worker.py`. They use
+Playwright and accept JSON payloads:
+
+```bash
+python computer_worker.py --command browser_open_url --payload '{"url":"https://example.com"}'
+python computer_worker.py --command browser_search --payload '{"query":"Tello drone SDK docs"}'
+python computer_worker.py --command browser_get_text
+python computer_worker.py --command browser_screenshot
+```
+
+Set `COMPUTER_USE_HEADLESS=false` to force a visible browser window when a
+desktop display is available.
