@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import socketserver
 import threading
 import time
@@ -27,6 +28,8 @@ from djitellopy import Tello
 
 HOST = "127.0.0.1"
 PORT = 8765
+TELLO_HOST = os.getenv("TELLO_HOST", "192.168.10.1")
+TELLO_RETRY_COUNT = int(os.getenv("TELLO_RETRY_COUNT", "1"))
 REPO_ROOT = Path(__file__).resolve().parent
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 
@@ -41,11 +44,20 @@ class DroneController:
 
     def _ensure_connected(self) -> Tello:
         if self.drone is None:
-            self.drone = Tello()
+            self.drone = Tello(host=TELLO_HOST, retry_count=TELLO_RETRY_COUNT)
 
         if not self.connected:
-            self.drone.connect()
-            self.connected = True
+            try:
+                self.drone.connect()
+                self.connected = True
+            except Exception as exc:
+                self.drone = None
+                self.connected = False
+                raise RuntimeError(
+                    "Could not reach the Tello drone. Make sure the drone is powered "
+                    f"on and this computer is connected to the Tello Wi-Fi network "
+                    f"({TELLO_HOST}). Original error: {exc}"
+                ) from exc
 
         return self.drone
 
@@ -260,6 +272,10 @@ def main() -> None:
 
     with DroneServer((args.host, args.port), DroneRequestHandler) as server:
         print(f"Drone service listening on {args.host}:{args.port}")
+        print(
+            f"Tello target: {TELLO_HOST} "
+            f"(retry_count={TELLO_RETRY_COUNT}; override with TELLO_HOST/TELLO_RETRY_COUNT)"
+        )
         print("Press Ctrl+C to land, stop the stream, and close the drone connection.")
         try:
             server.serve_forever()

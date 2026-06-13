@@ -46,6 +46,7 @@ SCREENSHOT_PATH = BROWSER_DIR / "screenshot.png"
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 DRONE_SERVICE_HOST = os.getenv("DRONE_SERVICE_HOST", "127.0.0.1")
 DRONE_SERVICE_PORT = int(os.getenv("DRONE_SERVICE_PORT", "8765"))
+DRONE_SERVICE_TIMEOUT_SECONDS = float(os.getenv("DRONE_SERVICE_TIMEOUT_SECONDS", "30"))
 SIMPLE_DRONE_PROGRAM = REPO_ROOT / "simple.py"
 PHOTO_DRONE_PROGRAM = REPO_ROOT / "360_photo.py"
 PHOTO_FILENAMES = [
@@ -360,8 +361,9 @@ def call_drone_service(command: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         with socket.create_connection(
             (DRONE_SERVICE_HOST, DRONE_SERVICE_PORT),
-            timeout=10,
+            timeout=DRONE_SERVICE_TIMEOUT_SECONDS,
         ) as sock:
+            sock.settimeout(DRONE_SERVICE_TIMEOUT_SECONDS)
             sock.sendall(request.encode("utf-8"))
             response = sock.makefile("r", encoding="utf-8").readline()
     except OSError as exc:
@@ -432,6 +434,18 @@ def run_drone_snapshot(payload: str) -> dict[str, Any]:
 
 def run_look_around(payload: str) -> dict[str, Any]:
     """Capture four drone photos with 360_photo.py and summarize them."""
+    service_status = call_drone_service("ping", {})
+    if service_status.get("status") == "ok":
+        return {
+            "status": "error",
+            "message": (
+                "The live drone service is running, so the legacy 360_photo.py "
+                "flow cannot use the Tello socket. Use drone_snapshot for the "
+                "real-time demo, or stop drone_service.py before running "
+                "drone_look_around."
+            ),
+        }
+
     data = parse_payload(payload)
     timeout_seconds = float(data.get("timeout_seconds", 120))
     session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

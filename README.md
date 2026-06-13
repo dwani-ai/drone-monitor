@@ -82,6 +82,11 @@ python3 computer_worker.py --command drone_snapshot
 python3 computer_worker.py --command drone_land
 ```
 
+The React `Take off` button and the Gemini Live voice command both go through
+the same long-lived `drone_service.py` path. If the button works but voice does
+not, restart `gemini_live_computer_use.py` so it picks up the latest tool
+instructions, then test the worker path directly with `drone_takeoff`.
+
 `drone_snapshot` captures one current Tello camera frame through the service,
 saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a
 short spoken summary. The older `drone_look_around` command still performs the
@@ -90,6 +95,23 @@ full 360-degree capture sequence and lands at the end.
 The dashboard reads Gemini Live events from `.gemini_live_events.jsonl`. Override
 that path for both `gemini_live_computer_use.py` and `web_server.py` with
 `GEMINI_LIVE_EVENT_LOG=/path/to/events.jsonl` if needed.
+
+If `drone_service.py` repeatedly logs `Aborting command 'command'. Did not
+receive a response after 7 seconds`, the local service is running but the Tello
+itself is not reachable. Check that the drone is powered on, the computer is
+connected to the Tello Wi-Fi network, and no other script is already connected
+to the drone. Then retry:
+
+```bash
+python3 computer_worker.py --command drone_connect
+```
+
+The service defaults to a single Tello command retry so failed preflight checks
+return quickly. You can override the target or retries if needed:
+
+```bash
+TELLO_HOST=192.168.10.1 TELLO_RETRY_COUNT=1 python3 drone_service.py
+```
 
 For Vertex AI, use Google Cloud application-default credentials. The Vertex AI
 Live endpoint does not accept API keys for these calls:
