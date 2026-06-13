@@ -308,14 +308,28 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "status",
                         "takeoff",
                         "snapshot",
+                        "explore",
+                        "forward",
+                        "back",
+                        "left",
+                        "right",
+                        "up",
+                        "down",
+                        "turn_left",
+                        "turn_right",
+                        "stop",
                         "land",
                         "shutdown",
                     ],
                     "description": (
                         "Drone action. connect checks the service/drone connection; "
                         "status reads telemetry; takeoff starts flight; snapshot "
-                        "captures and summarizes the current camera view; land lands "
-                        "the drone; shutdown closes the drone service connection."
+                        "captures and summarizes the current camera view; explore "
+                        "captures the current view and suggests one safe next action "
+                        "without moving; forward, back, left, right, up, and down move one 5 cm increment; "
+                        "turn_left and turn_right rotate one small 15 degree increment; "
+                        "stop sends zero RC velocity; land lands the drone; shutdown "
+                        "closes the drone service connection."
                     ),
                 },
                 "settle_seconds": {
@@ -343,10 +357,20 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "start, lift off, or fly, call drone_control with action=takeoff "
             "exactly once, then report the result. Do not also call snapshot in "
             "the same turn. If the user asks for battery, height, telemetry, or "
-            "drone status, call drone_control with action=status. If the user asks "
-            "'what do you see?', 'what can you see?', 'look', 'look around', or "
-            "asks for the current view, call drone_control with action=snapshot "
+            "drone status, call drone_control with action=status. For movement "
+            "requests, call exactly one movement action per turn. Use forward, "
+            "back, left, right, up, or down for one 5 cm increment. Use turn_left "
+            "or turn_right for one 15 degree increment. If the user says 'a little', "
+            "'slightly', or gives no distance, still use exactly one 5 cm increment. "
+            "Do not multiply movements or loop. If the user asks 'what do you see?', "
+            "'what can you see?', 'look', 'look around', or asks for the current "
+            "view, call drone_control with action=snapshot "
             "and speak the returned one-line summary directly. If the user asks "
+            "to explore, guide me, inspect the room, or asks what to do next, call "
+            "drone_control with action=explore. The explore action only suggests "
+            "one next action; do not execute it automatically. Tell the user the "
+            "observation and suggested action, then ask for confirmation. If the "
+            "user confirms, call exactly that one movement action. If the user asks "
             "to land, call drone_control with action=land exactly once. "
             "Do not run legacy 360-degree scan programs during the live demo; "
             "explain that live snapshot is available instead. "

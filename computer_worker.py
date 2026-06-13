@@ -33,6 +33,16 @@ SUPPORTED_COMMANDS = [
     "drone_status",
     "drone_takeoff",
     "drone_snapshot",
+    "drone_explore",
+    "drone_forward",
+    "drone_back",
+    "drone_left",
+    "drone_right",
+    "drone_up",
+    "drone_down",
+    "drone_turn_left",
+    "drone_turn_right",
+    "drone_stop",
     "drone_land",
     "drone_shutdown",
     "drone_run_simple",
@@ -56,6 +66,17 @@ PHOTO_FILENAMES = [
     "tello_photo_270_deg.jpg",
 ]
 VISION_MODEL_ID = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+EXPLORE_ACTIONS = {
+    "forward",
+    "back",
+    "left",
+    "right",
+    "up",
+    "down",
+    "turn_left",
+    "turn_right",
+    "stop",
+}
 
 
 def parse_payload(payload: str) -> dict[str, Any]:
@@ -355,6 +376,66 @@ def summarize_drone_snapshot(image_path: Path) -> str:
     return " ".join(summary.split())
 
 
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Parse JSON from plain or fenced model output."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+
+    return parsed
+
+
+def analyze_exploration_step(image_path: Path, telemetry: dict[str, Any]) -> dict[str, Any]:
+    """Ask Gemini for one safe next exploration action without executing it."""
+    from google.genai import types
+
+    client = create_genai_client()
+    prompt = (
+        "You are guiding a small indoor Tello drone using very small movements. "
+        "Look at the current camera frame and suggest exactly one safe next action. "
+        "Allowed actions are: forward, back, left, right, up, down, turn_left, "
+        "turn_right, stop. Translational actions are one 5 cm increment. Turns are "
+        "one 15 degree increment. Prefer stop if the scene is too dark, too close "
+        "to obstacles, unclear, or unsafe. Return only compact JSON with keys: "
+        "observation, suggested_action, reason. Telemetry: "
+        f"{json.dumps(telemetry, default=str)}"
+    )
+    response = client.models.generate_content(
+        model=VISION_MODEL_ID,
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=image_path.read_bytes(), mime_type="image/jpeg"),
+        ],
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned an empty exploration analysis.")
+
+    parsed = parse_json_object(text)
+    suggested_action = str(parsed.get("suggested_action", "stop")).strip()
+    if suggested_action not in EXPLORE_ACTIONS:
+        suggested_action = "stop"
+
+    return {
+        "observation": " ".join(str(parsed.get("observation", "")).split()),
+        "suggested_action": suggested_action,
+        "reason": " ".join(str(parsed.get("reason", "")).split()),
+        "raw_response": text,
+    }
+
+
 def call_drone_service(command: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Send one JSON command to the long-lived local drone service."""
     request = json.dumps({"command": command, "payload": payload}) + "\n"
@@ -429,6 +510,41 @@ def run_drone_snapshot(payload: str) -> dict[str, Any]:
     return {
         **result,
         "summary": summary,
+    }
+
+
+def run_drone_explore(payload: str) -> dict[str, Any]:
+    """Capture the current view and suggest one next safe exploration action."""
+    data = parse_payload(payload)
+    result = call_drone_service("snapshot", data)
+    if result.get("status") != "ok":
+        return result
+
+    image_path = Path(str(result.get("image", "")))
+    if not image_path.exists():
+        return {
+            "status": "error",
+            "message": f"Drone exploration image was not found: {image_path}",
+            "drone_service_result": result,
+        }
+
+    try:
+        analysis = analyze_exploration_step(image_path, dict(result.get("drone") or {}))
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to analyze exploration step: {exc}",
+            "image": str(image_path),
+            "drone_service_result": result,
+        }
+
+    return {
+        **result,
+        "exploration": analysis,
+        "message": (
+            f"{analysis['observation']} Suggested next action: "
+            f"{analysis['suggested_action']}. {analysis['reason']}"
+        ),
     }
 
 
@@ -571,6 +687,15 @@ def handle_command(command: str, payload: str) -> dict[str, Any]:
         "drone_connect",
         "drone_status",
         "drone_takeoff",
+        "drone_forward",
+        "drone_back",
+        "drone_left",
+        "drone_right",
+        "drone_up",
+        "drone_down",
+        "drone_turn_left",
+        "drone_turn_right",
+        "drone_stop",
         "drone_land",
         "drone_shutdown",
     }:
@@ -578,6 +703,9 @@ def handle_command(command: str, payload: str) -> dict[str, Any]:
 
     if command == "drone_snapshot":
         return run_drone_snapshot(payload)
+
+    if command == "drone_explore":
+        return run_drone_explore(payload)
 
     if command == "drone_run_simple":
         return run_simple_drone_program(payload)

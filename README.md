@@ -69,6 +69,12 @@ Try saying:
 ```text
 Take off.
 Drone status.
+Move forward.
+Move left.
+Go up.
+Turn right.
+Stop.
+Explore the room.
 What do you see?
 Land.
 ```
@@ -78,6 +84,12 @@ The real-time demo commands are:
 ```bash
 python3 computer_worker.py --command drone_status
 python3 computer_worker.py --command drone_takeoff
+python3 computer_worker.py --command drone_forward
+python3 computer_worker.py --command drone_left
+python3 computer_worker.py --command drone_up
+python3 computer_worker.py --command drone_turn_right
+python3 computer_worker.py --command drone_stop
+python3 computer_worker.py --command drone_explore
 python3 computer_worker.py --command drone_snapshot
 python3 computer_worker.py --command drone_land
 ```
@@ -85,11 +97,22 @@ python3 computer_worker.py --command drone_land
 The React `Take off` button and the Gemini Live voice command both go through
 the same long-lived `drone_service.py` path. Gemini Live uses a dedicated
 `drone_control` tool with a small action list: `connect`, `status`, `takeoff`,
-`snapshot`, `land`, and `shutdown`. This keeps drone control separate from the
-generic browser/computer tool and avoids legacy commands during the live demo.
+`snapshot`, `explore`, `forward`, `back`, `left`, `right`, `up`, `down`,
+`turn_left`, `turn_right`, `stop`, `land`, and `shutdown`. This keeps drone
+control separate from the generic browser/computer tool and avoids legacy
+commands during the live demo.
 If the button works but voice does not, restart `gemini_live_computer_use.py` so
 it picks up the latest tool instructions, then test the worker path directly
 with `drone_takeoff`.
+
+Movement commands are intentionally tiny. The Tello SDK's normal movement
+commands start at 20 cm, so this project uses short RC-control pulses for
+5 cm demo increments and sends `stop` after every movement.
+
+Guided exploration mode is semi-autonomous. Say `Explore the room` or `What
+should I do next?`; Gemini captures the current view, suggests exactly one safe
+next action, and asks for confirmation before moving. If you confirm, Gemini
+executes only that one 5 cm movement or 15 degree turn.
 
 `drone_snapshot` captures one current Tello camera frame through the service,
 saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a

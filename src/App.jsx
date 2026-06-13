@@ -155,9 +155,27 @@ function App() {
             <button onClick={() => sendDroneCommand('takeoff')}>Take off</button>
             <button onClick={() => sendDroneCommand('status')}>Status</button>
             <button onClick={() => sendDroneCommand('snapshot')}>Snapshot</button>
+            <button onClick={() => sendDroneCommand('stop')}>Stop</button>
             <button className="danger" onClick={() => sendDroneCommand('land')}>
               Land
             </button>
+          </div>
+          <h2>Movement</h2>
+          <p className="command-result">
+            Each movement button sends one cautious 5 cm RC pulse.
+          </p>
+          <div className="movement-pad">
+            <button onClick={() => sendDroneCommand('up')}>Up 5 cm</button>
+            <button onClick={() => sendDroneCommand('forward')}>Forward 5 cm</button>
+            <button onClick={() => sendDroneCommand('down')}>Down 5 cm</button>
+            <button onClick={() => sendDroneCommand('turn_left')}>Turn left</button>
+            <button onClick={() => sendDroneCommand('left')}>Left 5 cm</button>
+            <button onClick={() => sendDroneCommand('stop')}>Stop</button>
+            <button onClick={() => sendDroneCommand('right')}>Right 5 cm</button>
+            <button onClick={() => sendDroneCommand('turn_right')}>Turn right</button>
+            <span />
+            <button onClick={() => sendDroneCommand('back')}>Back 5 cm</button>
+            <span />
           </div>
           {lastCommand && (
             <p className="command-result">

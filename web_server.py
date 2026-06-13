@@ -141,7 +141,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         command = path.removeprefix(prefix)
-        if command not in {"connect", "status", "takeoff", "land", "shutdown", "snapshot"}:
+        if command not in {
+            "connect",
+            "status",
+            "takeoff",
+            "snapshot",
+            "forward",
+            "back",
+            "left",
+            "right",
+            "up",
+            "down",
+            "turn_left",
+            "turn_right",
+            "stop",
+            "land",
+            "shutdown",
+        }:
             self.send_json(
                 {"status": "error", "message": f"Unsupported drone command: {command}"},
                 status=HTTPStatus.BAD_REQUEST,

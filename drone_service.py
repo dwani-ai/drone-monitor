@@ -30,6 +30,12 @@ HOST = "127.0.0.1"
 PORT = 8765
 TELLO_HOST = os.getenv("TELLO_HOST", "192.168.10.1")
 TELLO_RETRY_COUNT = int(os.getenv("TELLO_RETRY_COUNT", "1"))
+MOVE_INCREMENT_CM = 5
+MOVE_RC_VELOCITY = int(os.getenv("TELLO_MOVE_RC_VELOCITY", "20"))
+MOVE_RC_SECONDS = float(os.getenv("TELLO_MOVE_RC_SECONDS", "0.25"))
+TURN_INCREMENT_DEGREES = 15
+TURN_RC_VELOCITY = int(os.getenv("TELLO_TURN_RC_VELOCITY", "40"))
+TURN_RC_SECONDS = float(os.getenv("TELLO_TURN_RC_SECONDS", "0.25"))
 REPO_ROOT = Path(__file__).resolve().parent
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 
@@ -138,9 +144,23 @@ class DroneController:
             if command == "land":
                 drone = self._ensure_connected()
                 if self.took_off:
+                    self.stop_motion()
                     drone.land()
                     self.took_off = False
                 return {"status": "ok", "drone": self._status_payload(drone)}
+
+            if command in {
+                "forward",
+                "back",
+                "left",
+                "right",
+                "up",
+                "down",
+                "turn_left",
+                "turn_right",
+                "stop",
+            }:
+                return self.move(command)
 
             if command == "snapshot":
                 return self.snapshot(payload)
@@ -155,6 +175,59 @@ class DroneController:
             return {"status": "error", "message": f"Unsupported command: {command}"}
         except Exception as exc:
             return {"status": "error", "message": str(exc)}
+
+    def move(self, command: str) -> dict[str, Any]:
+        drone = self._ensure_stream()
+        if not self.took_off:
+            return {
+                "status": "error",
+                "message": "Drone is not airborne. Say take off before movement commands.",
+                "drone": self._status_payload(drone),
+            }
+
+        if command == "stop":
+            self.stop_motion()
+            return {
+                "status": "ok",
+                "movement": "stop",
+                "drone": self._status_payload(drone),
+            }
+
+        rc_vectors = {
+            "forward": (0, MOVE_RC_VELOCITY, 0, 0),
+            "back": (0, -MOVE_RC_VELOCITY, 0, 0),
+            "left": (-MOVE_RC_VELOCITY, 0, 0, 0),
+            "right": (MOVE_RC_VELOCITY, 0, 0, 0),
+            "up": (0, 0, MOVE_RC_VELOCITY, 0),
+            "down": (0, 0, -MOVE_RC_VELOCITY, 0),
+            "turn_left": (0, 0, 0, -TURN_RC_VELOCITY),
+            "turn_right": (0, 0, 0, TURN_RC_VELOCITY),
+        }
+        rc_vector = rc_vectors[command]
+        duration = TURN_RC_SECONDS if command.startswith("turn_") else MOVE_RC_SECONDS
+        increment = (
+            f"{TURN_INCREMENT_DEGREES} degrees"
+            if command.startswith("turn_")
+            else f"{MOVE_INCREMENT_CM} cm"
+        )
+
+        drone.send_rc_control(*rc_vector)
+        time.sleep(duration)
+        self.stop_motion()
+        time.sleep(0.15)
+
+        return {
+            "status": "ok",
+            "movement": command,
+            "increment": increment,
+            "rc_velocity": rc_vector,
+            "duration_seconds": duration,
+            "drone": self._status_payload(drone),
+        }
+
+    def stop_motion(self) -> None:
+        if self.drone is not None:
+            self.drone.send_rc_control(0, 0, 0, 0)
 
     def snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         drone = self._ensure_stream()
