@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import subprocess
@@ -17,6 +18,8 @@ from typing import Any
 from google import genai
 from google.genai import errors
 from google.genai import types
+
+import computer_worker
 
 
 DEVELOPER_MODEL_ID = "gemini-2.5-flash-native-audio-latest"
@@ -50,6 +53,28 @@ PROTECTED_DRONE_COMMANDS = {
     "drone_stop",
     "drone_shutdown",
 }
+# Pure-flight/telemetry commands have no vision or browser work, so we can talk
+# to the long-lived drone service in-process instead of spawning a worker
+# subprocess per command. This trims process-startup latency from the most
+# frequent live-demo actions. snapshot/explore stay on the worker because they
+# need the vision model and its environment.
+DIRECT_FLIGHT_COMMANDS = {
+    "drone_connect",
+    "drone_status",
+    "drone_takeoff",
+    "drone_land",
+    "drone_forward",
+    "drone_back",
+    "drone_left",
+    "drone_right",
+    "drone_up",
+    "drone_down",
+    "drone_turn_left",
+    "drone_turn_right",
+    "drone_stop",
+    "drone_shutdown",
+}
+BUNDLED_WORKER_PATH = Path(__file__).resolve().parent / "computer_worker.py"
 
 
 def append_live_event(event: dict[str, Any]) -> None:
@@ -480,6 +505,7 @@ async def play_model_audio(
     stop_event: asyncio.Event,
 ) -> None:
     """Play Gemini Live PCM audio responses."""
+    loop = asyncio.get_running_loop()
     with sd_module.RawOutputStream(
         samplerate=OUTPUT_SAMPLE_RATE,
         channels=CHANNELS,
@@ -488,7 +514,10 @@ async def play_model_audio(
         while not stop_event.is_set():
             chunk = await speaker_queue.get()
             try:
-                stream.write(chunk)
+                # stream.write blocks until ALSA accepts the buffer. Run it off
+                # the event loop so microphone forwarding and websocket pings
+                # keep flowing while audio plays.
+                await loop.run_in_executor(None, stream.write, chunk)
             except KeyboardInterrupt:
                 stop_event.set()
                 return
@@ -501,10 +530,44 @@ async def receive_live_messages(
     timeout_seconds: float,
     worker_env: dict[str, str],
     stop_event: asyncio.Event,
+    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]],
+    flight_state: dict[str, bool],
 ) -> None:
-    """Handle audio, text, and tool-call messages from Gemini Live."""
-    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]] = {}
-    drone_airborne = False
+    """Handle audio, text, and tool-call messages from Gemini Live.
+
+    recent_drone_commands and flight_state are owned by the caller so flight
+    status and the duplicate-suppression cooldown survive websocket reconnects.
+    """
+    loop = asyncio.get_running_loop()
+    use_direct_flight = program_path == BUNDLED_WORKER_PATH
+
+    async def run_worker(worker_command: str, worker_payload: str) -> dict[str, Any]:
+        """Dispatch a tool command off the event loop.
+
+        Pure-flight commands go straight to the drone service in-process; the
+        rest run as the worker subprocess. Either way the call is offloaded to a
+        thread so microphone forwarding and websocket pings keep flowing (a long
+        inline call makes the Live server drop the connection).
+        """
+        if use_direct_flight and worker_command in DIRECT_FLIGHT_COMMANDS:
+            return await loop.run_in_executor(
+                None,
+                computer_worker.run_drone_service_command,
+                worker_command,
+                worker_payload,
+            )
+
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                run_computer_program,
+                command=worker_command,
+                payload=worker_payload,
+                program_path=program_path,
+                timeout_seconds=timeout_seconds,
+                extra_env=worker_env,
+            ),
+        )
 
     while not stop_event.is_set():
         saw_message = False
@@ -515,6 +578,27 @@ async def receive_live_messages(
                 saw_message = True
                 if stop_event.is_set():
                     break
+
+                server_content = getattr(message, "server_content", None)
+                if server_content is not None and getattr(
+                    server_content, "interrupted", False
+                ):
+                    # User started speaking; drop queued audio so we stop
+                    # talking over them instead of finishing the old response.
+                    drained = 0
+                    while not speaker_queue.empty():
+                        try:
+                            speaker_queue.get_nowait()
+                            drained += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    if drained:
+                        append_live_event(
+                            {
+                                "type": "session",
+                                "message": "Interrupted by user; flushed pending audio.",
+                            }
+                        )
 
                 if getattr(message, "data", None):
                     await speaker_queue.put(message.data)
@@ -566,7 +650,7 @@ async def receive_live_messages(
                             "status": "error",
                             "message": f"Unknown tool: {tool_name}",
                         }
-                    elif command == "drone_takeoff" and drone_airborne:
+                    elif command == "drone_takeoff" and flight_state["airborne"]:
                         result = blocked_drone_result(
                             command,
                             "Drone is already airborne. I did not send another takeoff.",
@@ -582,27 +666,15 @@ async def receive_live_messages(
                             )
                             recent_drone_commands[command] = (now, previous[1])
                         else:
-                            result = run_computer_program(
-                                command=command,
-                                payload=payload,
-                                program_path=program_path,
-                                timeout_seconds=timeout_seconds,
-                                extra_env=worker_env,
-                            )
+                            result = await run_worker(command, payload)
                             recent_drone_commands[command] = (now, result)
                     else:
-                        result = run_computer_program(
-                            command=command,
-                            payload=payload,
-                            program_path=program_path,
-                            timeout_seconds=timeout_seconds,
-                            extra_env=worker_env,
-                        )
+                        result = await run_worker(command, payload)
 
                     if command == "drone_takeoff" and result.get("status") == "ok":
-                        drone_airborne = True
+                        flight_state["airborne"] = True
                     elif command == "drone_land" and result.get("status") == "ok":
-                        drone_airborne = False
+                        flight_state["airborne"] = False
 
                     print(f"Tool result: {json.dumps(result)}")
                     append_live_event(
@@ -650,6 +722,10 @@ async def run_live_client(args: argparse.Namespace) -> None:
     speaker_queue: asyncio.Queue[bytes] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     reconnect_delay = 2.0
+    # Owned here so flight status and the duplicate cooldown persist across
+    # websocket reconnects instead of resetting on every new session.
+    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]] = {}
+    flight_state: dict[str, bool] = {"airborne": False}
 
     def microphone_callback(indata: bytes, frames: int, time: Any, status: Any) -> None:
         if status:
@@ -703,6 +779,8 @@ async def run_live_client(args: argparse.Namespace) -> None:
                                 timeout_seconds=args.timeout,
                                 worker_env=worker_env,
                                 stop_event=stop_event,
+                                recent_drone_commands=recent_drone_commands,
+                                flight_state=flight_state,
                             )
                         ),
                     ]

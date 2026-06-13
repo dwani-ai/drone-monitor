@@ -36,6 +36,10 @@ MOVE_RC_SECONDS = float(os.getenv("TELLO_MOVE_RC_SECONDS", "0.25"))
 TURN_INCREMENT_DEGREES = 15
 TURN_RC_VELOCITY = int(os.getenv("TELLO_TURN_RC_VELOCITY", "40"))
 TURN_RC_SECONDS = float(os.getenv("TELLO_TURN_RC_SECONDS", "0.25"))
+# The Tello firmware auto-lands if it receives no command for ~15 seconds.
+# Send a heartbeat well under that window while airborne so the drone does not
+# land itself during the quiet gaps between voice commands.
+KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("TELLO_KEEPALIVE_SECONDS", "5"))
 REPO_ROOT = Path(__file__).resolve().parent
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 
@@ -48,6 +52,42 @@ class DroneController:
         self.took_off = False
         self.lock = threading.Lock()
         self.command_sequence = 0
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread: threading.Thread | None = None
+
+    def _start_keepalive(self) -> None:
+        """Begin sending periodic heartbeats so the Tello does not auto-land."""
+        # Clear the stop flag first so a still-running thread from a previous
+        # flight keeps beating instead of exiting after a quick land/takeoff.
+        self._keepalive_stop.clear()
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            name="tello-keepalive",
+            daemon=True,
+        )
+        self._keepalive_thread.start()
+
+    def _stop_keepalive(self) -> None:
+        self._keepalive_stop.set()
+
+    def _keepalive_loop(self) -> None:
+        """Reset the Tello auto-land timer every few seconds while airborne.
+
+        Uses a zero RC-control packet rather than send_keepalive(): RC control is
+        fire-and-forget (no response wait), so it cannot hold self.lock for the
+        7s command timeout and delay a user's land/stop command.
+        """
+        while not self._keepalive_stop.wait(KEEPALIVE_INTERVAL_SECONDS):
+            with self.lock:
+                if not self.took_off or self.drone is None:
+                    continue
+                try:
+                    self.drone.send_rc_control(0, 0, 0, 0)
+                except Exception as exc:
+                    print(f"Warning: keepalive failed: {exc}")
 
     def _ensure_connected(self) -> Tello:
         if self.drone is None:
@@ -76,6 +116,23 @@ class DroneController:
             time.sleep(2)
 
         return drone
+
+    def _looks_airborne(self, drone: Tello) -> bool:
+        """Best-effort check that the drone is really flying.
+
+        Tello height telemetry is noisy and can briefly read 0, so sample a few
+        times and treat any clearly positive height as airborne. Used to detect
+        a stale took_off flag after a firmware auto-land.
+        """
+        for _ in range(3):
+            try:
+                if drone.get_height() >= 10:
+                    return True
+            except Exception:
+                return True  # Telemetry unavailable; do not relaunch blindly.
+            time.sleep(0.2)
+
+        return False
 
     def _status_payload(
         self,
@@ -138,13 +195,18 @@ class DroneController:
                 # Tello SDK flight control only needs the command connection.
                 # Video streaming is started lazily by frame/snapshot requests.
                 drone = self._ensure_connected()
-                if self.took_off:
+                if self.took_off and self._looks_airborne(drone):
                     return {
                         "status": "ok",
                         "already_done": True,
                         "message": "Drone is already airborne.",
                         "drone": self._status_payload(drone),
                     }
+
+                # If took_off is stale (the firmware auto-landed during a quiet
+                # gap), fall through and actually take off again.
+                self.took_off = False
+                self._stop_keepalive()
 
                 try:
                     drone.takeoff()
@@ -162,6 +224,7 @@ class DroneController:
 
                 self.took_off = True
                 drone.is_flying = True
+                self._start_keepalive()
                 time.sleep(2)
                 return {
                     "status": "ok",
@@ -199,6 +262,7 @@ class DroneController:
                     if height == 0:
                         self.took_off = False
                         drone.is_flying = False
+                        self._stop_keepalive()
                         status["airborne"] = False
                         return {
                             "status": "ok",
@@ -220,6 +284,7 @@ class DroneController:
 
                 self.took_off = False
                 drone.is_flying = False
+                self._stop_keepalive()
                 return {
                     "status": "ok",
                     "message": "Drone landed.",
@@ -282,7 +347,10 @@ class DroneController:
         }
 
     def move(self, command: str) -> dict[str, Any]:
-        drone = self._ensure_stream()
+        # Movement only needs the command channel. Avoid _ensure_stream here so
+        # the first move does not pay the streamon + 2s warmup cost and does not
+        # add video traffic that competes with flight control.
+        drone = self._ensure_connected()
         if not self.took_off:
             return {
                 "status": "error",
@@ -386,6 +454,7 @@ class DroneController:
         return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     def close(self) -> None:
+        self._stop_keepalive()
         if self.drone is None:
             return
 

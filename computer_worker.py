@@ -265,6 +265,19 @@ def run_browser_action(command: str, payload: str) -> dict[str, Any]:
 
 def run_simple_drone_program(payload: str) -> dict[str, Any]:
     """Run the allowlisted simple.py drone program."""
+    service_status = call_drone_service("ping", {})
+    if service_status.get("status") == "ok":
+        return {
+            "status": "error",
+            "message": (
+                "The live drone service is running, so simple.py cannot open the "
+                "Tello socket (it would hit 'Address already in use') and it would "
+                "land the drone at the end. Use the live drone_control actions for "
+                "the real-time demo, or stop drone_service.py before running "
+                "drone_run_simple."
+            ),
+        }
+
     data = parse_payload(payload)
     timeout_seconds = float(data.get("timeout_seconds", 60))
 
