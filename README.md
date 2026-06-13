@@ -21,6 +21,7 @@ camera stream, telemetry, and a live event feed.
 - [Testing commands directly](#testing-commands-directly)
 - [Browser computer-use](#browser-computer-use)
 - [Legacy 360-degree capture](#legacy-360-degree-capture)
+- [Browser simulator game](#browser-simulator-game)
 - [Troubleshooting](#troubleshooting)
 
 ## Overview
@@ -507,6 +508,23 @@ Each look-around run stores its photos in a fresh `drone_captures/<session-id>/`
 directory, so summaries only use images from the current run. If all four photos
 are captured but the final cleanup rotation fails, the worker still summarizes
 the current session photos and returns a warning.
+
+## Browser simulator game
+
+No Tello on hand? The [`game/`](game/README.md) folder is a browser-based 3D
+drone simulator you can fly **by voice** with the exact same Gemini Live stack.
+`game/sim_service.py` speaks the identical TCP `:8765` protocol as
+`drone_service.py`, so `gemini_live_computer_use.py` and `computer_worker.py`
+run **unchanged** — and the simulated first-person camera feeds the same
+"what do you see?" / explore vision path.
+
+```bash
+python game/sim_service.py            # run INSTEAD of drone_service.py
+cd game && npm install && npm run dev  # http://127.0.0.1:5174
+python gemini_live_computer_use.py --vertexai
+```
+
+See [`game/README.md`](game/README.md) for the full walkthrough.
 
 ## Troubleshooting
 

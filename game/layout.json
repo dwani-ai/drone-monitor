@@ -1,0 +1,76 @@
+{
+  "room": {
+    "width": 600,
+    "depth": 400,
+    "height": 250,
+    "comment": "Dimensions in cm. x in [-width/2, width/2] (right), y in [-depth/2, depth/2] (forward), z in [0, height] (up)."
+  },
+  "start": {
+    "x": 0,
+    "y": -150,
+    "z": 0,
+    "yaw": 0,
+    "comment": "yaw 0 faces +y (toward the far wall). Drone rests on the floor until takeoff."
+  },
+  "drone": {
+    "radius": 20,
+    "takeoff_height": 70
+  },
+  "obstacles": [
+    {
+      "id": "table",
+      "label": "wooden table",
+      "color": "#9c6b3f",
+      "x": 120,
+      "y": -10,
+      "z": 0,
+      "w": 140,
+      "d": 80,
+      "h": 75
+    },
+    {
+      "id": "chair",
+      "label": "red chair",
+      "color": "#b5341f",
+      "x": -150,
+      "y": 40,
+      "z": 0,
+      "w": 55,
+      "d": 55,
+      "h": 95
+    },
+    {
+      "id": "shelf",
+      "label": "tall bookshelf",
+      "color": "#5c5048",
+      "x": 0,
+      "y": 178,
+      "z": 0,
+      "w": 220,
+      "d": 36,
+      "h": 220
+    },
+    {
+      "id": "plant",
+      "label": "potted plant",
+      "color": "#2f7d4f",
+      "x": 210,
+      "y": 130,
+      "z": 0,
+      "w": 50,
+      "d": 50,
+      "h": 130
+    },
+    {
+      "id": "crate",
+      "label": "cardboard crate",
+      "color": "#c8a165",
+      "x": -200,
+      "y": -120,
+      "z": 0,
+      "w": 70,
+      "d": 70,
+      "h": 70
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Drone Simulator - Voice Controlled</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+
+      <div id="fpv-panel">
+        <div class="fpv-label">Drone camera (vision feed)</div>
+        <canvas id="fpv"></canvas>
+      </div>
+
+      <header id="topbar">
+        <div class="brand">
+          <span class="dot" id="conn-dot"></span>
+          Drone Simulator
+        </div>
+        <div class="hint">Control by voice via Gemini Live: "Take off", "turn right", "what do you see?", "land".</div>
+      </header>
+
+      <section id="hud">
+        <h2>Telemetry</h2>
+        <div class="telemetry">
+          <div><span>Connection</span><strong id="t-conn">connecting...</strong></div>
+          <div><span>Airborne</span><strong id="t-air">false</strong></div>
+          <div><span>Battery</span><strong id="t-bat">--</strong></div>
+          <div><span>Height</span><strong id="t-height">--</strong></div>
+          <div><span>Heading</span><strong id="t-yaw">--</strong></div>
+          <div><span>Last command</span><strong id="t-last">none</strong></div>
+        </div>
+        <h2>Gemini Live</h2>
+        <div id="events" class="events">
+          <p class="muted">Waiting for Gemini Live events. Start the voice client.</p>
+        </div>
+      </section>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
