@@ -5,16 +5,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from google import genai
 from google.genai import errors
 from google.genai import types
+
+import computer_worker
 
 
 DEVELOPER_MODEL_ID = "gemini-2.5-flash-native-audio-latest"
@@ -25,6 +30,116 @@ OUTPUT_SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_DTYPE = "int16"
 CHUNK_SIZE = 1024
+DEFAULT_EVENT_LOG_PATH = Path(__file__).resolve().parent / ".gemini_live_events.jsonl"
+EVENT_LOG_PATH = Path(
+    os.getenv("GEMINI_LIVE_EVENT_LOG", str(DEFAULT_EVENT_LOG_PATH))
+).expanduser()
+DUPLICATE_DRONE_COMMAND_SECONDS = float(
+    os.getenv("DUPLICATE_DRONE_COMMAND_SECONDS", "8")
+)
+# Movement/turn commands are meant to be repeated ("turn right" again and again),
+# so they use a much shorter window than takeoff/land/snapshot. It only needs to
+# be long enough to drop accidental duplicate tool calls within a single turn,
+# not to block the next intentional nudge.
+MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS = float(
+    os.getenv("MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS", "1.0")
+)
+MOVEMENT_DRONE_COMMANDS = {
+    "drone_forward",
+    "drone_back",
+    "drone_left",
+    "drone_right",
+    "drone_up",
+    "drone_down",
+    "drone_turn_left",
+    "drone_turn_right",
+    "drone_stop",
+}
+PROTECTED_DRONE_COMMANDS = {
+    "drone_takeoff",
+    "drone_snapshot",
+    "drone_explore",
+    "drone_land",
+    "drone_shutdown",
+    *MOVEMENT_DRONE_COMMANDS,
+}
+
+
+def duplicate_window_seconds(command: str) -> float:
+    """Cooldown a repeated drone command is suppressed within."""
+    if command in MOVEMENT_DRONE_COMMANDS:
+        return MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS
+    return DUPLICATE_DRONE_COMMAND_SECONDS
+# Pure-flight/telemetry commands have no vision or browser work, so we can talk
+# to the long-lived drone service in-process instead of spawning a worker
+# subprocess per command. This trims process-startup latency from the most
+# frequent live-demo actions. snapshot/explore stay on the worker because they
+# need the vision model and its environment.
+DIRECT_FLIGHT_COMMANDS = {
+    "drone_connect",
+    "drone_status",
+    "drone_takeoff",
+    "drone_land",
+    "drone_forward",
+    "drone_back",
+    "drone_left",
+    "drone_right",
+    "drone_up",
+    "drone_down",
+    "drone_turn_left",
+    "drone_turn_right",
+    "drone_stop",
+    "drone_shutdown",
+}
+BUNDLED_WORKER_PATH = Path(__file__).resolve().parent / "computer_worker.py"
+
+
+def append_live_event(event: dict[str, Any]) -> None:
+    """Append one dashboard-readable Gemini Live event."""
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    try:
+        EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with EVENT_LOG_PATH.open("a", encoding="utf-8") as event_file:
+            event_file.write(json.dumps(payload, default=str) + "\n")
+    except OSError as exc:
+        print(f"Could not write Gemini Live event log: {exc}", file=sys.stderr)
+
+
+def is_normal_connection_close(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "ConnectionClosedOK" or "1000 None" in str(exc)
+
+
+def duplicate_drone_result(
+    command: str,
+    cached_result: dict[str, Any],
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Return a non-executing result for an accidental repeated drone action."""
+    return {
+        "status": "ok",
+        "duplicate_suppressed": True,
+        "command": command,
+        "message": (
+            f"Duplicate {command} ignored because it was requested "
+            f"{elapsed_seconds:.1f}s ago. No drone command was sent."
+        ),
+        "spoken_message": "Already handled. I did not send another drone command.",
+        "previous_result": cached_result,
+    }
+
+
+def blocked_drone_result(command: str, message: str) -> dict[str, Any]:
+    """Return a non-executing result for a state-invalid drone action."""
+    return {
+        "status": "ok",
+        "state_blocked": True,
+        "command": command,
+        "message": message,
+        "spoken_message": message,
+    }
 
 
 def load_sounddevice() -> Any:
@@ -47,8 +162,13 @@ def run_computer_program(
     payload: str,
     program_path: Path,
     timeout_seconds: float,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Call the separate Python program used for computer actions."""
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
     try:
         completed = subprocess.run(
             [
@@ -64,6 +184,7 @@ def run_computer_program(
             text=True,
             timeout=timeout_seconds,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -79,18 +200,27 @@ def run_computer_program(
         }
 
     stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    parsed_stdout: Any | None = None
+    if stdout:
+        try:
+            parsed_stdout = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed_stdout = None
+
+    if isinstance(parsed_stdout, dict):
+        return {
+            **parsed_stdout,
+            "worker_returncode": completed.returncode,
+            "worker_stderr": stderr,
+        }
+
     response: dict[str, Any] = {
         "status": "ok" if completed.returncode == 0 else "error",
         "returncode": completed.returncode,
         "stdout": stdout,
-        "stderr": completed.stderr.strip(),
+        "stderr": stderr,
     }
-
-    if stdout:
-        try:
-            response["json"] = json.loads(stdout)
-        except json.JSONDecodeError:
-            pass
 
     return response
 
@@ -165,6 +295,19 @@ def resolve_model(args: argparse.Namespace) -> str:
     return DEVELOPER_MODEL_ID
 
 
+def build_worker_env(args: argparse.Namespace) -> dict[str, str]:
+    worker_env: dict[str, str] = {}
+    if args.vertexai:
+        project = get_vertex_project(args)
+        location = get_vertex_location(args)
+        if project:
+            worker_env["GOOGLE_CLOUD_PROJECT"] = project
+        if location:
+            worker_env["GOOGLE_CLOUD_LOCATION"] = location
+
+    return worker_env
+
+
 def get_supported_methods(model: Any) -> list[str]:
     methods = (
         getattr(model, "supported_generation_methods", None)
@@ -194,24 +337,36 @@ def list_live_models(args: argparse.Namespace) -> None:
 
 
 def build_live_config(enable_tools: bool) -> dict[str, Any]:
-    """Build the Gemini Live config with an explicit function declaration."""
+    """Build the Gemini Live config with explicit function declarations."""
     run_program_declaration = {
         "name": "run_computer_program",
         "description": (
             "Run an allowlisted command in a separate local Python program. "
-            "Use this for computer actions, browser actions, drone helper actions, "
-            "or local checks. Browser payloads should be JSON strings."
+            "Use this only for computer actions, browser actions, or local checks. "
+            "Browser payloads should be JSON strings. Do not use this for drone "
+            "flight control."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
+                    "enum": [
+                        "status",
+                        "echo",
+                        "list_repo_files",
+                        "browser_open_url",
+                        "browser_search",
+                        "browser_get_text",
+                        "browser_click_text",
+                        "browser_type_text",
+                        "browser_screenshot",
+                    ],
                     "description": (
                         "Worker command to run. Supported commands are status, echo, "
                         "list_repo_files, browser_open_url, browser_search, "
                         "browser_get_text, browser_click_text, browser_type_text, "
-                        "browser_screenshot, and drone_run_simple."
+                        "and browser_screenshot."
                     ),
                 },
                 "payload": {
@@ -222,12 +377,69 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "{\"query\":\"drone safety checklist\"}, "
                         "{\"text\":\"More details\"}, or "
                         "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
-                        "\"submit\":true}. For drone_run_simple, optional JSON is "
-                        "{\"timeout_seconds\":60}."
+                        "\"submit\":true}."
                     ),
                 },
             },
             "required": ["command"],
+        },
+    }
+    drone_control_declaration = {
+        "name": "drone_control",
+        "description": (
+            "Control the live Tello drone service using a small safe action set. "
+            "Use this for all drone flight, telemetry, and current-view requests."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "connect",
+                        "status",
+                        "takeoff",
+                        "snapshot",
+                        "explore",
+                        "forward",
+                        "back",
+                        "left",
+                        "right",
+                        "up",
+                        "down",
+                        "turn_left",
+                        "turn_right",
+                        "stop",
+                        "land",
+                        "shutdown",
+                    ],
+                    "description": (
+                        "Drone action. connect checks the service/drone connection; "
+                        "status reads telemetry; takeoff starts flight; snapshot "
+                        "captures and summarizes the current camera view; explore "
+                        "captures the current view and suggests one safe next action "
+                        "without moving; forward, back, left, right, up, and down move one 5 cm increment; "
+                        "turn_left and turn_right rotate one small 15 degree increment; "
+                        "stop sends zero RC velocity; land lands the drone; shutdown "
+                        "closes the drone service connection."
+                    ),
+                },
+                "settle_seconds": {
+                    "type": "number",
+                    "description": (
+                        "Optional snapshot delay before reading the camera frame. "
+                        "Only relevant for action=snapshot; default is 0.2."
+                    ),
+                },
+                "confirmed_land": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true only after the user explicitly confirms landing. "
+                        "Never set true for the first land request."
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     }
 
@@ -239,15 +451,46 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "call run_computer_program instead of claiming you did it. "
             "For browser requests, use the browser_* worker commands with JSON "
             "payloads. Do not request arbitrary shell commands. "
-            "When the user asks to run the drone simple program or simple.py, "
-            "call run_computer_program with command drone_run_simple. "
-            "Keep spoken responses short and confirm tool results clearly. "
+            "For every drone request, use the drone_control tool. Never use "
+            "run_computer_program for drone control. If the user says take off, "
+            "start, lift off, or fly, call drone_control with action=takeoff "
+            "exactly once, then report the result. Do not also call snapshot in "
+            "the same turn. If the user asks for battery, height, telemetry, or "
+            "drone status, call drone_control with action=status. For movement "
+            "requests, call exactly one movement action per turn. Use forward, "
+            "back, left, right, up, or down for one 5 cm increment. Use turn_left "
+            "or turn_right for one 15 degree increment. If the user says 'a little', "
+            "'slightly', or gives no distance, still use exactly one 5 cm increment. "
+            "Do not multiply movements or loop. If the user asks 'what do you see?', "
+            "'what can you see?', 'look', 'look around', or asks for the current "
+            "view, call drone_control with action=snapshot "
+            "and speak the returned one-line summary directly. If the user asks "
+            "to explore, guide me, inspect the room, or asks what to do next, call "
+            "drone_control with action=explore. The explore action only suggests "
+            "one next action; do not execute it automatically. Tell the user the "
+            "observation and suggested action, then ask for confirmation. If the "
+            "user confirms, call exactly that one movement action. If the user asks "
+            "to land, do not land immediately. Ask 'Confirm landing?' first. Only "
+            "after the user explicitly says yes or confirms landing, call "
+            "drone_control with action=land and confirmed_land=true exactly once. "
+            "Do not run legacy 360-degree scan programs during the live demo; "
+            "explain that live snapshot is available instead. "
+            "For drone tool results, prefer the spoken_message field exactly. "
+            "If status is error, say one short sentence with the message and recovery. "
+            "Do not read raw detail, stderr, tracebacks, file paths, JSON, or error codes aloud. "
+            "Do not retry a failed drone action automatically; wait for the user. "
+            "Keep spoken responses short and confirm tool results clearly once. "
+            "Do not repeat the same confirmation, observation, or instruction. "
+            "If a tool result has duplicate_suppressed=true, do not repeat the "
+            "previous message; say briefly that the command was already handled. "
             "After each tool result, continue listening for the user's next request."
         ),
     }
 
     if enable_tools:
-        config["tools"] = [{"function_declarations": [run_program_declaration]}]
+        config["tools"] = [
+            {"function_declarations": [run_program_declaration, drone_control_declaration]}
+        ]
 
     return config
 
@@ -260,12 +503,17 @@ async def send_microphone_audio(
     """Forward microphone PCM chunks to Gemini Live."""
     while not stop_event.is_set():
         chunk = await audio_queue.get()
-        await session.send_realtime_input(
-            audio=types.Blob(
-                data=chunk,
-                mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+        try:
+            await session.send_realtime_input(
+                audio=types.Blob(
+                    data=chunk,
+                    mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+                )
             )
-        )
+        except Exception as exc:
+            if stop_event.is_set() or is_normal_connection_close(exc):
+                return
+            raise
 
 
 async def play_model_audio(
@@ -274,6 +522,7 @@ async def play_model_audio(
     stop_event: asyncio.Event,
 ) -> None:
     """Play Gemini Live PCM audio responses."""
+    loop = asyncio.get_running_loop()
     with sd_module.RawOutputStream(
         samplerate=OUTPUT_SAMPLE_RATE,
         channels=CHANNELS,
@@ -281,7 +530,14 @@ async def play_model_audio(
     ) as stream:
         while not stop_event.is_set():
             chunk = await speaker_queue.get()
-            stream.write(chunk)
+            try:
+                # stream.write blocks until ALSA accepts the buffer. Run it off
+                # the event loop so microphone forwarding and websocket pings
+                # keep flowing while audio plays.
+                await loop.run_in_executor(None, stream.write, chunk)
+            except KeyboardInterrupt:
+                stop_event.set()
+                return
 
 
 async def receive_live_messages(
@@ -289,56 +545,185 @@ async def receive_live_messages(
     speaker_queue: asyncio.Queue[bytes],
     program_path: Path,
     timeout_seconds: float,
+    worker_env: dict[str, str],
     stop_event: asyncio.Event,
+    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]],
+    flight_state: dict[str, bool],
 ) -> None:
-    """Handle audio, text, and tool-call messages from Gemini Live."""
-    async for message in session.receive():
-        if stop_event.is_set():
-            break
+    """Handle audio, text, and tool-call messages from Gemini Live.
 
-        if getattr(message, "data", None):
-            await speaker_queue.put(message.data)
+    recent_drone_commands and flight_state are owned by the caller so flight
+    status and the duplicate-suppression cooldown survive websocket reconnects.
+    """
+    loop = asyncio.get_running_loop()
+    use_direct_flight = program_path == BUNDLED_WORKER_PATH
 
-        if getattr(message, "text", None):
-            print(message.text, end="", flush=True)
+    async def run_worker(worker_command: str, worker_payload: str) -> dict[str, Any]:
+        """Dispatch a tool command off the event loop.
 
-        tool_call = getattr(message, "tool_call", None)
-        if not tool_call:
-            continue
-
-        function_responses = []
-        for function_call in tool_call.function_calls:
-            args = dict(function_call.args or {})
-            command = str(args.get("command", "status"))
-            payload = str(args.get("payload", ""))
-            print(f"\nTool call: {function_call.name}({args})")
-
-            if function_call.name != "run_computer_program":
-                result = {
-                    "status": "error",
-                    "message": f"Unknown tool: {function_call.name}",
-                }
-            else:
-                result = run_computer_program(
-                    command=command,
-                    payload=payload,
-                    program_path=program_path,
-                    timeout_seconds=timeout_seconds,
-                )
-
-            print(f"Tool result: {json.dumps(result)}")
-            function_responses.append(
-                {
-                    "name": function_call.name,
-                    "id": function_call.id,
-                    "response": {"result": result},
-                }
+        Pure-flight commands go straight to the drone service in-process; the
+        rest run as the worker subprocess. Either way the call is offloaded to a
+        thread so microphone forwarding and websocket pings keep flowing (a long
+        inline call makes the Live server drop the connection).
+        """
+        if use_direct_flight and worker_command in DIRECT_FLIGHT_COMMANDS:
+            return await loop.run_in_executor(
+                None,
+                computer_worker.run_drone_service_command,
+                worker_command,
+                worker_payload,
             )
 
-        if function_responses:
-            await session.send_tool_response(function_responses=function_responses)
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                run_computer_program,
+                command=worker_command,
+                payload=worker_payload,
+                program_path=program_path,
+                timeout_seconds=timeout_seconds,
+                extra_env=worker_env,
+            ),
+        )
 
-    print("\nGemini Live receive stream ended.", file=sys.stderr)
+    while not stop_event.is_set():
+        saw_message = False
+
+        try:
+            receive_stream = session.receive()
+            async for message in receive_stream:
+                saw_message = True
+                if stop_event.is_set():
+                    break
+
+                server_content = getattr(message, "server_content", None)
+                if server_content is not None and getattr(
+                    server_content, "interrupted", False
+                ):
+                    # User started speaking; drop queued audio so we stop
+                    # talking over them instead of finishing the old response.
+                    drained = 0
+                    while not speaker_queue.empty():
+                        try:
+                            speaker_queue.get_nowait()
+                            drained += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    if drained:
+                        append_live_event(
+                            {
+                                "type": "session",
+                                "message": "Interrupted by user; flushed pending audio.",
+                            }
+                        )
+
+                if getattr(message, "data", None):
+                    await speaker_queue.put(message.data)
+
+                if getattr(message, "text", None):
+                    print(message.text, end="", flush=True)
+                    append_live_event({"type": "gemini_text", "text": message.text})
+
+                tool_call = getattr(message, "tool_call", None)
+                if not tool_call:
+                    continue
+
+                function_responses = []
+                for function_call in tool_call.function_calls:
+                    args = dict(function_call.args or {})
+                    tool_name = function_call.name
+                    command = str(args.get("command", "status"))
+                    payload = str(args.get("payload", ""))
+                    if tool_name == "drone_control":
+                        action = str(args.get("action", "status"))
+                        command = f"drone_{action}"
+                        payload_data: dict[str, Any] = {"source": "gemini_live"}
+                        if action == "snapshot" and "settle_seconds" in args:
+                            payload_data["settle_seconds"] = args["settle_seconds"]
+                        if action == "land" and args.get("confirmed_land") is True:
+                            payload_data["confirmed_land"] = True
+                        payload = json.dumps(payload_data)
+
+                    print(f"\nTool call: {function_call.name}({args})")
+                    append_live_event(
+                        {
+                            "type": "tool_call",
+                            "name": tool_name,
+                            "command": command,
+                            "args": args,
+                        }
+                    )
+
+                    if tool_name == "run_computer_program" and command.startswith("drone_"):
+                        result = {
+                            "status": "error",
+                            "message": (
+                                "Drone commands must use the drone_control tool, not "
+                                "run_computer_program."
+                            ),
+                        }
+                    elif tool_name not in {"run_computer_program", "drone_control"}:
+                        result = {
+                            "status": "error",
+                            "message": f"Unknown tool: {tool_name}",
+                        }
+                    elif command == "drone_takeoff" and flight_state["airborne"]:
+                        result = blocked_drone_result(
+                            command,
+                            "Drone is already airborne. I did not send another takeoff.",
+                        )
+                    elif command in PROTECTED_DRONE_COMMANDS:
+                        now = time.monotonic()
+                        previous = recent_drone_commands.get(command)
+                        if previous and now - previous[0] < duplicate_window_seconds(command):
+                            result = duplicate_drone_result(
+                                command=command,
+                                cached_result=previous[1],
+                                elapsed_seconds=now - previous[0],
+                            )
+                            recent_drone_commands[command] = (now, previous[1])
+                        else:
+                            result = await run_worker(command, payload)
+                            recent_drone_commands[command] = (now, result)
+                    else:
+                        result = await run_worker(command, payload)
+
+                    if command == "drone_takeoff" and result.get("status") == "ok":
+                        flight_state["airborne"] = True
+                    elif command == "drone_land" and result.get("status") == "ok":
+                        flight_state["airborne"] = False
+
+                    print(f"Tool result: {json.dumps(result)}")
+                    append_live_event(
+                        {
+                            "type": "tool_result",
+                            "name": tool_name,
+                            "command": command,
+                            "result": result,
+                        }
+                    )
+                    function_responses.append(
+                        {
+                            "name": tool_name,
+                            "id": function_call.id,
+                            "response": {"result": result},
+                        }
+                    )
+
+                if function_responses:
+                    await session.send_tool_response(function_responses=function_responses)
+        except Exception as exc:
+            if stop_event.is_set() or is_normal_connection_close(exc):
+                return
+            raise
+
+        if saw_message:
+            print("\nGemini Live turn ended. Continuing to listen...", file=sys.stderr)
+            append_live_event(
+                {"type": "session", "message": "Gemini Live turn ended."}
+            )
+        else:
+            await asyncio.sleep(0.1)
 
 
 async def run_live_client(args: argparse.Namespace) -> None:
@@ -349,10 +734,15 @@ async def run_live_client(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Computer program not found: {program_path}")
 
     client = create_client(args)
+    worker_env = build_worker_env(args)
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
     speaker_queue: asyncio.Queue[bytes] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     reconnect_delay = 2.0
+    # Owned here so flight status and the duplicate cooldown persist across
+    # websocket reconnects instead of resetting on every new session.
+    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]] = {}
+    flight_state: dict[str, bool] = {"airborne": False}
 
     def microphone_callback(indata: bytes, frames: int, time: Any, status: Any) -> None:
         if status:
@@ -360,8 +750,10 @@ async def run_live_client(args: argparse.Namespace) -> None:
         loop.call_soon_threadsafe(audio_queue.put_nowait, bytes(indata))
 
     print("Connecting to Gemini Live. Speak into your microphone.")
-    print("Try: 'Use the computer to check status' or 'Use the computer to echo hello'.")
+    print("Try: 'Take off', 'what do you see?', 'drone status', or 'land'.")
+    print(f"Dashboard event log: {EVENT_LOG_PATH}")
     print("Press Ctrl+C to stop.")
+    append_live_event({"type": "session", "message": "Connecting to Gemini Live."})
 
     with sd.RawInputStream(
         samplerate=INPUT_SAMPLE_RATE,
@@ -383,6 +775,13 @@ async def run_live_client(args: argparse.Namespace) -> None:
                     config=build_live_config(enable_tools=not args.disable_tools),
                 ) as session:
                     print("Connected. Listening for requests...")
+                    append_live_event(
+                        {
+                            "type": "session",
+                            "message": "Connected. Listening for requests.",
+                            "model": resolve_model(args),
+                        }
+                    )
 
                     tasks = [
                         asyncio.create_task(
@@ -395,7 +794,10 @@ async def run_live_client(args: argparse.Namespace) -> None:
                                 speaker_queue=speaker_queue,
                                 program_path=program_path,
                                 timeout_seconds=args.timeout,
+                                worker_env=worker_env,
                                 stop_event=stop_event,
+                                recent_drone_commands=recent_drone_commands,
+                                flight_state=flight_state,
                             )
                         ),
                     ]
@@ -411,13 +813,21 @@ async def run_live_client(args: argparse.Namespace) -> None:
                     await asyncio.gather(*pending, return_exceptions=True)
 
                     for task in done:
-                        task.result()
+                        try:
+                            task.result()
+                        except Exception as exc:
+                            if is_normal_connection_close(exc):
+                                continue
+                            raise
             except asyncio.CancelledError:
                 raise
             except errors.APIError:
                 raise
             except Exception as exc:
                 print(f"\nLive session ended: {exc}", file=sys.stderr)
+                append_live_event(
+                    {"type": "session", "message": f"Live session ended: {exc}"}
+                )
 
             print(f"Reconnecting in {reconnect_delay:.0f}s...", file=sys.stderr)
             await asyncio.sleep(reconnect_delay)
@@ -464,7 +874,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
+        default=180.0,
         help="Seconds to wait for the external computer program.",
     )
     return parser.parse_args()
