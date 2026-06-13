@@ -135,7 +135,9 @@ class DroneController:
                 return {"status": "ok", "drone": self._status_payload(drone)}
 
             if command == "takeoff":
-                drone = self._ensure_stream()
+                # Tello SDK flight control only needs the command connection.
+                # Video streaming is started lazily by frame/snapshot requests.
+                drone = self._ensure_connected()
                 if self.took_off:
                     return {
                         "status": "ok",
@@ -159,6 +161,7 @@ class DroneController:
                     )
 
                 self.took_off = True
+                drone.is_flying = True
                 time.sleep(2)
                 return {
                     "status": "ok",
@@ -195,6 +198,7 @@ class DroneController:
                     height = status.get("height_cm")
                     if height == 0:
                         self.took_off = False
+                        drone.is_flying = False
                         status["airborne"] = False
                         return {
                             "status": "ok",
@@ -215,6 +219,7 @@ class DroneController:
                     )
 
                 self.took_off = False
+                drone.is_flying = False
                 return {
                     "status": "ok",
                     "message": "Drone landed.",

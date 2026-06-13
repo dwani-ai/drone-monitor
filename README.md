@@ -58,6 +58,20 @@ npm run dev
 Open `http://127.0.0.1:5173` to see the live drone camera stream, telemetry,
 flight controls, and Gemini Live event feed.
 
+The dashboard does not start the video stream automatically. Click `Start
+stream` only after the drone service is ready. The MJPEG stream is throttled to
+one frame per second by default so camera requests do not flood the same command
+path used for flight control:
+
+```bash
+STREAM_FRAME_INTERVAL_SECONDS=1.0 python3 web_server.py
+```
+
+The service keeps Tello flight control and video control separate. `takeoff`
+uses only the Tello command channel (`command` then `takeoff`). It does not send
+`streamon`. Video starts lazily only when `snapshot`, `frame`, or the dashboard
+stream requests camera frames.
+
 Then start Gemini Live in another terminal:
 
 ```bash
@@ -132,6 +146,10 @@ ask `Confirm landing?` and only sends `land` after you explicitly confirm. The
 React dashboard also uses a two-step `Land` / `Confirm Land` flow. The drone
 service logs each request source (`gemini_live`, `dashboard`, or
 `computer_worker`) so accidental commands are easier to trace.
+
+If you are analyzing behavior, watch the `drone_service.py` terminal. Real flight
+commands are logged with sequence numbers. Frame requests are intentionally not
+printed because the video stream can request frames continuously.
 
 `drone_snapshot` captures one current Tello camera frame through the service,
 saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a

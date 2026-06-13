@@ -89,6 +89,17 @@ def duplicate_drone_result(
     }
 
 
+def blocked_drone_result(command: str, message: str) -> dict[str, Any]:
+    """Return a non-executing result for a state-invalid drone action."""
+    return {
+        "status": "ok",
+        "state_blocked": True,
+        "command": command,
+        "message": message,
+        "spoken_message": message,
+    }
+
+
 def load_sounddevice() -> Any:
     """Import sounddevice and explain the native PortAudio dependency if missing."""
     try:
@@ -493,6 +504,7 @@ async def receive_live_messages(
 ) -> None:
     """Handle audio, text, and tool-call messages from Gemini Live."""
     recent_drone_commands: dict[str, tuple[float, dict[str, Any]]] = {}
+    drone_airborne = False
 
     while not stop_event.is_set():
         saw_message = False
@@ -554,6 +566,11 @@ async def receive_live_messages(
                             "status": "error",
                             "message": f"Unknown tool: {tool_name}",
                         }
+                    elif command == "drone_takeoff" and drone_airborne:
+                        result = blocked_drone_result(
+                            command,
+                            "Drone is already airborne. I did not send another takeoff.",
+                        )
                     elif command in PROTECTED_DRONE_COMMANDS:
                         now = time.monotonic()
                         previous = recent_drone_commands.get(command)
@@ -581,6 +598,11 @@ async def receive_live_messages(
                             timeout_seconds=timeout_seconds,
                             extra_env=worker_env,
                         )
+
+                    if command == "drone_takeoff" and result.get("status") == "ok":
+                        drone_airborne = True
+                    elif command == "drone_land" and result.get("status") == "ok":
+                        drone_airborne = False
 
                     print(f"Tool result: {json.dumps(result)}")
                     append_live_event(
