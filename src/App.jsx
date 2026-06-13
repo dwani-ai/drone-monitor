@@ -30,7 +30,9 @@ function App() {
   const [events, setEvents] = useState([])
   const [lastCommand, setLastCommand] = useState(null)
   const [streamKey, setStreamKey] = useState(0)
+  const [streamEnabled, setStreamEnabled] = useState(false)
   const [pollDrone, setPollDrone] = useState(false)
+  const [landConfirmationArmed, setLandConfirmationArmed] = useState(false)
 
   const latestGeminiResponse = useMemo(() => {
     return events.find((event) => event.type === 'tool_result' && event.result?.summary)
@@ -48,16 +50,19 @@ function App() {
     return data
   }
 
-  async function sendDroneCommand(command) {
+  async function sendDroneCommand(command, payload = {}) {
     setLastCommand({ command, status: 'running' })
     const response = await fetch(`${API_BASE}/api/drone/${command}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify(payload),
     })
     const data = await response.json()
     setLastCommand({ command, status: data.status, message: data.message })
     setDroneStatus(data)
+    if (command !== 'land') {
+      setLandConfirmationArmed(false)
+    }
     if (['connect', 'takeoff', 'status'].includes(command)) {
       setPollDrone(true)
     }
@@ -65,8 +70,23 @@ function App() {
       setPollDrone(false)
     }
     if (['connect', 'takeoff', 'snapshot'].includes(command)) {
+      setStreamEnabled(true)
       setStreamKey((value) => value + 1)
     }
+  }
+
+  function handleLandClick() {
+    if (!landConfirmationArmed) {
+      setLandConfirmationArmed(true)
+      setLastCommand({
+        command: 'land',
+        status: 'confirm',
+        message: 'Click Confirm Land to land the drone.',
+      })
+      return
+    }
+
+    sendDroneCommand('land', { confirmed_land: true })
   }
 
   useEffect(() => {
@@ -133,18 +153,33 @@ function App() {
           <div className="panel-header">
             <div>
               <h2>Drone Camera</h2>
-              <p>MJPEG stream from `drone_service.py`</p>
+              <p>
+                {streamEnabled
+                  ? 'MJPEG stream from `drone_service.py`'
+                  : 'Stream is paused until you start it.'}
+              </p>
             </div>
-            <button onClick={() => setStreamKey((value) => value + 1)}>
-              Refresh stream
+            <button
+              onClick={() => {
+                setStreamEnabled(true)
+                setStreamKey((value) => value + 1)
+              }}
+            >
+              {streamEnabled ? 'Refresh stream' : 'Start stream'}
             </button>
           </div>
           <div className="video-frame">
-            <img
-              key={streamKey}
-              src={`${API_BASE}/api/drone/stream`}
-              alt="Live drone camera stream"
-            />
+            {streamEnabled ? (
+              <img
+                key={streamKey}
+                src={`${API_BASE}/api/drone/stream`}
+                alt="Live drone camera stream"
+              />
+            ) : (
+              <div className="stream-placeholder">
+                Start the stream after the drone service is ready.
+              </div>
+            )}
           </div>
         </div>
 
@@ -156,8 +191,11 @@ function App() {
             <button onClick={() => sendDroneCommand('status')}>Status</button>
             <button onClick={() => sendDroneCommand('snapshot')}>Snapshot</button>
             <button onClick={() => sendDroneCommand('stop')}>Stop</button>
-            <button className="danger" onClick={() => sendDroneCommand('land')}>
-              Land
+            <button
+              className={`danger ${landConfirmationArmed ? 'armed' : ''}`}
+              onClick={handleLandClick}
+            >
+              {landConfirmationArmed ? 'Confirm Land' : 'Land'}
             </button>
           </div>
           <h2>Movement</h2>

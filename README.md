@@ -114,6 +114,25 @@ should I do next?`; Gemini captures the current view, suggests exactly one safe
 next action, and asks for confirmation before moving. If you confirm, Gemini
 executes only that one 5 cm movement or 15 degree turn.
 
+Gemini Live also suppresses accidental repeated drone actions for a short
+cooldown so it does not keep saying or executing the same command in a loop. The
+default cooldown is 8 seconds:
+
+```bash
+DUPLICATE_DRONE_COMMAND_SECONDS=8 python3 gemini_live_computer_use.py --vertexai
+```
+
+Drone errors are returned with a concise `spoken_message` plus structured fields
+like `error_code`, `detail`, and `recovery`. Gemini Live is instructed to speak
+only the concise message/recovery and not read raw SDK errors, tracebacks, file
+paths, or JSON aloud.
+
+For safety, Gemini Live cannot land the drone on the first land request. It must
+ask `Confirm landing?` and only sends `land` after you explicitly confirm. The
+React dashboard also uses a two-step `Land` / `Confirm Land` flow. The drone
+service logs each request source (`gemini_live`, `dashboard`, or
+`computer_worker`) so accidental commands are easier to trace.
+
 `drone_snapshot` captures one current Tello camera frame through the service,
 saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a
 short spoken summary. The older `drone_look_around` command still performs the

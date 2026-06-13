@@ -23,6 +23,9 @@ EVENT_LOG_PATH = Path(
 ).expanduser()
 DRONE_SERVICE_HOST = os.getenv("DRONE_SERVICE_HOST", "127.0.0.1")
 DRONE_SERVICE_PORT = int(os.getenv("DRONE_SERVICE_PORT", "8765"))
+STREAM_FRAME_INTERVAL_SECONDS = float(
+    os.getenv("STREAM_FRAME_INTERVAL_SECONDS", "1.0")
+)
 
 
 def call_drone_service(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -164,7 +167,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self.send_json(call_drone_service(command, self.read_json_body()))
+        payload = self.read_json_body()
+        payload.setdefault("source", "dashboard")
+        self.send_json(call_drone_service(command, payload))
 
     def read_json_body(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -195,7 +200,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
     def send_frame(self) -> None:
-        result = call_drone_service("frame", {"quality": 80})
+        result = call_drone_service(
+            "frame",
+            {"quality": 80, "source": "dashboard_frame"},
+        )
         if result.get("status") != "ok":
             self.send_json(result, status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
@@ -217,7 +225,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         while True:
             result = call_drone_service(
                 "frame",
-                {"quality": 75, "settle_seconds": 0.01},
+                {
+                    "quality": 70,
+                    "settle_seconds": 0.01,
+                    "source": "dashboard_stream",
+                },
             )
             if result.get("status") == "ok":
                 frame_bytes = base64.b64decode(str(result["image_base64"]))
@@ -235,7 +247,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     return
 
-            time.sleep(0.2)
+            time.sleep(STREAM_FRAME_INTERVAL_SECONDS)
 
     def send_event_stream(self) -> None:
         self.send_response(HTTPStatus.OK)

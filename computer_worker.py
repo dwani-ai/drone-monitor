@@ -475,16 +475,62 @@ def call_drone_service(command: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "error", "message": "Drone service response was not an object."}
 
 
+def with_spoken_message(result: dict[str, Any], command: str) -> dict[str, Any]:
+    """Attach a concise user-facing message for Gemini Live."""
+    if "spoken_message" in result:
+        return result
+
+    if result.get("duplicate_suppressed"):
+        result["spoken_message"] = str(result.get("message") or "Already handled.")
+        return result
+
+    if result.get("status") != "ok":
+        message = str(result.get("message") or "Drone command failed.")
+        recovery = str(result.get("recovery") or "").strip()
+        result["spoken_message"] = f"{message} {recovery}".strip()
+        return result
+
+    drone = result.get("drone") if isinstance(result.get("drone"), dict) else {}
+    battery = drone.get("battery_percent")
+    height = drone.get("height_cm")
+    telemetry = []
+    if battery not in {None, ""}:
+        telemetry.append(f"battery {battery}%")
+    if height not in {None, ""}:
+        telemetry.append(f"height {height} cm")
+    telemetry_text = f" ({', '.join(telemetry)})" if telemetry else ""
+
+    if result.get("already_done"):
+        result["spoken_message"] = str(result.get("message") or "Already done.")
+    elif command == "drone_takeoff":
+        result["spoken_message"] = f"Takeoff complete{telemetry_text}."
+    elif command == "drone_land":
+        result["spoken_message"] = f"Landed{telemetry_text}."
+    elif command == "drone_status":
+        result["spoken_message"] = f"Drone status{telemetry_text}."
+    elif command.startswith("drone_") and result.get("movement"):
+        result["spoken_message"] = (
+            f"Moved {result['movement']} by {result.get('increment', 'one step')}"
+            f"{telemetry_text}."
+        )
+    else:
+        result["spoken_message"] = str(result.get("message") or "Done.")
+
+    return result
+
+
 def run_drone_service_command(command: str, payload: str) -> dict[str, Any]:
     """Proxy a worker drone_* command to drone_service.py."""
     data = parse_payload(payload)
+    data.setdefault("source", "computer_worker")
     service_command = command.removeprefix("drone_")
-    return call_drone_service(service_command, data)
+    return with_spoken_message(call_drone_service(service_command, data), command)
 
 
 def run_drone_snapshot(payload: str) -> dict[str, Any]:
     """Capture and summarize one current drone camera frame."""
     data = parse_payload(payload)
+    data.setdefault("source", "computer_worker")
     result = call_drone_service("snapshot", data)
     if result.get("status") != "ok":
         return result
@@ -510,12 +556,14 @@ def run_drone_snapshot(payload: str) -> dict[str, Any]:
     return {
         **result,
         "summary": summary,
+        "spoken_message": summary,
     }
 
 
 def run_drone_explore(payload: str) -> dict[str, Any]:
     """Capture the current view and suggest one next safe exploration action."""
     data = parse_payload(payload)
+    data.setdefault("source", "computer_worker")
     result = call_drone_service("snapshot", data)
     if result.get("status") != "ok":
         return result
@@ -544,6 +592,10 @@ def run_drone_explore(payload: str) -> dict[str, Any]:
         "message": (
             f"{analysis['observation']} Suggested next action: "
             f"{analysis['suggested_action']}. {analysis['reason']}"
+        ),
+        "spoken_message": (
+            f"{analysis['observation']} I suggest {analysis['suggested_action']}. "
+            "Should I do that?"
         ),
     }
 

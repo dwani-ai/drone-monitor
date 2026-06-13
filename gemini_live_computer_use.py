@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,25 @@ DEFAULT_EVENT_LOG_PATH = Path(__file__).resolve().parent / ".gemini_live_events.
 EVENT_LOG_PATH = Path(
     os.getenv("GEMINI_LIVE_EVENT_LOG", str(DEFAULT_EVENT_LOG_PATH))
 ).expanduser()
+DUPLICATE_DRONE_COMMAND_SECONDS = float(
+    os.getenv("DUPLICATE_DRONE_COMMAND_SECONDS", "8")
+)
+PROTECTED_DRONE_COMMANDS = {
+    "drone_takeoff",
+    "drone_snapshot",
+    "drone_explore",
+    "drone_land",
+    "drone_forward",
+    "drone_back",
+    "drone_left",
+    "drone_right",
+    "drone_up",
+    "drone_down",
+    "drone_turn_left",
+    "drone_turn_right",
+    "drone_stop",
+    "drone_shutdown",
+}
 
 
 def append_live_event(event: dict[str, Any]) -> None:
@@ -48,6 +68,25 @@ def append_live_event(event: dict[str, Any]) -> None:
 
 def is_normal_connection_close(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "ConnectionClosedOK" or "1000 None" in str(exc)
+
+
+def duplicate_drone_result(
+    command: str,
+    cached_result: dict[str, Any],
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Return a non-executing result for an accidental repeated drone action."""
+    return {
+        "status": "ok",
+        "duplicate_suppressed": True,
+        "command": command,
+        "message": (
+            f"Duplicate {command} ignored because it was requested "
+            f"{elapsed_seconds:.1f}s ago. No drone command was sent."
+        ),
+        "spoken_message": "Already handled. I did not send another drone command.",
+        "previous_result": cached_result,
+    }
 
 
 def load_sounddevice() -> Any:
@@ -339,6 +378,13 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "Only relevant for action=snapshot; default is 0.2."
                     ),
                 },
+                "confirmed_land": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true only after the user explicitly confirms landing. "
+                        "Never set true for the first land request."
+                    ),
+                },
             },
             "required": ["action"],
         },
@@ -371,10 +417,19 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "one next action; do not execute it automatically. Tell the user the "
             "observation and suggested action, then ask for confirmation. If the "
             "user confirms, call exactly that one movement action. If the user asks "
-            "to land, call drone_control with action=land exactly once. "
+            "to land, do not land immediately. Ask 'Confirm landing?' first. Only "
+            "after the user explicitly says yes or confirms landing, call "
+            "drone_control with action=land and confirmed_land=true exactly once. "
             "Do not run legacy 360-degree scan programs during the live demo; "
             "explain that live snapshot is available instead. "
-            "Keep spoken responses short and confirm tool results clearly. "
+            "For drone tool results, prefer the spoken_message field exactly. "
+            "If status is error, say one short sentence with the message and recovery. "
+            "Do not read raw detail, stderr, tracebacks, file paths, JSON, or error codes aloud. "
+            "Do not retry a failed drone action automatically; wait for the user. "
+            "Keep spoken responses short and confirm tool results clearly once. "
+            "Do not repeat the same confirmation, observation, or instruction. "
+            "If a tool result has duplicate_suppressed=true, do not repeat the "
+            "previous message; say briefly that the command was already handled. "
             "After each tool result, continue listening for the user's next request."
         ),
     }
@@ -437,6 +492,8 @@ async def receive_live_messages(
     stop_event: asyncio.Event,
 ) -> None:
     """Handle audio, text, and tool-call messages from Gemini Live."""
+    recent_drone_commands: dict[str, tuple[float, dict[str, Any]]] = {}
+
     while not stop_event.is_set():
         saw_message = False
 
@@ -467,9 +524,11 @@ async def receive_live_messages(
                     if tool_name == "drone_control":
                         action = str(args.get("action", "status"))
                         command = f"drone_{action}"
-                        payload_data: dict[str, Any] = {}
+                        payload_data: dict[str, Any] = {"source": "gemini_live"}
                         if action == "snapshot" and "settle_seconds" in args:
                             payload_data["settle_seconds"] = args["settle_seconds"]
+                        if action == "land" and args.get("confirmed_land") is True:
+                            payload_data["confirmed_land"] = True
                         payload = json.dumps(payload_data)
 
                     print(f"\nTool call: {function_call.name}({args})")
@@ -495,6 +554,25 @@ async def receive_live_messages(
                             "status": "error",
                             "message": f"Unknown tool: {tool_name}",
                         }
+                    elif command in PROTECTED_DRONE_COMMANDS:
+                        now = time.monotonic()
+                        previous = recent_drone_commands.get(command)
+                        if previous and now - previous[0] < DUPLICATE_DRONE_COMMAND_SECONDS:
+                            result = duplicate_drone_result(
+                                command=command,
+                                cached_result=previous[1],
+                                elapsed_seconds=now - previous[0],
+                            )
+                            recent_drone_commands[command] = (now, previous[1])
+                        else:
+                            result = run_computer_program(
+                                command=command,
+                                payload=payload,
+                                program_path=program_path,
+                                timeout_seconds=timeout_seconds,
+                                extra_env=worker_env,
+                            )
+                            recent_drone_commands[command] = (now, result)
                     else:
                         result = run_computer_program(
                             command=command,

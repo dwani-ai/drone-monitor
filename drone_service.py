@@ -47,6 +47,7 @@ class DroneController:
         self.stream_started = False
         self.took_off = False
         self.lock = threading.Lock()
+        self.command_sequence = 0
 
     def _ensure_connected(self) -> Tello:
         if self.drone is None:
@@ -135,19 +136,90 @@ class DroneController:
 
             if command == "takeoff":
                 drone = self._ensure_stream()
-                if not self.took_off:
+                if self.took_off:
+                    return {
+                        "status": "ok",
+                        "already_done": True,
+                        "message": "Drone is already airborne.",
+                        "drone": self._status_payload(drone),
+                    }
+
+                try:
                     drone.takeoff()
-                    self.took_off = True
-                    time.sleep(2)
-                return {"status": "ok", "drone": self._status_payload(drone)}
+                except Exception as exc:
+                    return self.drone_error(
+                        "takeoff_rejected",
+                        "The drone rejected takeoff.",
+                        exc,
+                        drone,
+                        recovery=(
+                            "Check battery, propeller clearance, and that the drone is "
+                            "on a stable surface. Then try takeoff once."
+                        ),
+                    )
+
+                self.took_off = True
+                time.sleep(2)
+                return {
+                    "status": "ok",
+                    "message": "Drone takeoff completed.",
+                    "drone": self._status_payload(drone),
+                }
 
             if command == "land":
                 drone = self._ensure_connected()
-                if self.took_off:
-                    self.stop_motion()
+                if payload.get("source") in {"gemini_live", "dashboard"} and not payload.get(
+                    "confirmed_land"
+                ):
+                    return {
+                        "status": "error",
+                        "error_code": "confirmation_required",
+                        "message": "Landing needs explicit confirmation.",
+                        "recovery": "Ask the user to confirm landing before sending land.",
+                        "drone": self._status_payload(drone),
+                    }
+
+                if not self.took_off:
+                    return {
+                        "status": "ok",
+                        "already_done": True,
+                        "message": "Drone is already landed.",
+                        "drone": self._status_payload(drone),
+                    }
+
+                self.stop_motion()
+                try:
                     drone.land()
-                    self.took_off = False
-                return {"status": "ok", "drone": self._status_payload(drone)}
+                except Exception as exc:
+                    status = self._status_payload(drone)
+                    height = status.get("height_cm")
+                    if height == 0:
+                        self.took_off = False
+                        status["airborne"] = False
+                        return {
+                            "status": "ok",
+                            "already_done": True,
+                            "message": "Landing command was rejected, but telemetry says height is 0 cm.",
+                            "drone": status,
+                        }
+
+                    return self.drone_error(
+                        "land_rejected",
+                        "The drone rejected landing.",
+                        exc,
+                        drone,
+                        recovery=(
+                            "Use stop, make sure the drone is stable, then try land once. "
+                            "If it is already on the floor, use shutdown after confirming."
+                        ),
+                    )
+
+                self.took_off = False
+                return {
+                    "status": "ok",
+                    "message": "Drone landed.",
+                    "drone": self._status_payload(drone),
+                }
 
             if command in {
                 "forward",
@@ -172,16 +244,46 @@ class DroneController:
                 self.close()
                 return {"status": "ok", "message": "drone connection closed"}
 
-            return {"status": "error", "message": f"Unsupported command: {command}"}
+            return {
+                "status": "error",
+                "error_code": "unsupported_command",
+                "message": f"Unsupported command: {command}",
+                "recovery": "Use one of the supported drone_control actions.",
+            }
         except Exception as exc:
-            return {"status": "error", "message": str(exc)}
+            return self.drone_error(
+                "drone_command_failed",
+                "The drone command failed.",
+                exc,
+                self.drone,
+                recovery="Check the drone connection and try the command once.",
+            )
+
+    def drone_error(
+        self,
+        error_code: str,
+        message: str,
+        exc: Exception,
+        drone: Tello | None,
+        recovery: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "detail": str(exc),
+            "recovery": recovery,
+            "drone": self._status_payload(drone),
+        }
 
     def move(self, command: str) -> dict[str, Any]:
         drone = self._ensure_stream()
         if not self.took_off:
             return {
                 "status": "error",
-                "message": "Drone is not airborne. Say take off before movement commands.",
+                "error_code": "not_airborne",
+                "message": "Drone is not airborne.",
+                "recovery": "Say take off before movement commands.",
                 "drone": self._status_payload(drone),
             }
 
@@ -289,6 +391,9 @@ class DroneController:
             print(f"Warning: land failed during shutdown: {exc}")
         finally:
             self.took_off = False
+            # Prevent djitellopy.end()/__del__ from issuing a second land command.
+            if self.drone is not None:
+                self.drone.is_flying = False
 
         try:
             if self.stream_started:
@@ -297,6 +402,8 @@ class DroneController:
             print(f"Warning: streamoff failed during shutdown: {exc}")
         finally:
             self.stream_started = False
+            if self.drone is not None:
+                self.drone.stream_on = False
 
         try:
             self.drone.end()
@@ -318,6 +425,11 @@ class DroneRequestHandler(socketserver.StreamRequestHandler):
             payload = request.get("payload") or {}
             if not isinstance(payload, dict):
                 payload = {"text": str(payload)}
+            source = str(payload.get("source") or "unknown")
+            self.controller.command_sequence += 1
+            sequence = self.controller.command_sequence
+            if command != "frame":
+                print(f"Drone request #{sequence}: command={command} source={source}")
             response = self.controller.handle(command, payload)
         except json.JSONDecodeError as exc:
             response = {"status": "error", "message": f"Invalid JSON: {exc}"}
