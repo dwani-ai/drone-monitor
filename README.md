@@ -236,10 +236,12 @@ npm run dev               # React dashboard
 ```
 
 Open `http://127.0.0.1:5173` for the live camera stream, telemetry, flight
-controls, and Gemini Live event feed. The dashboard does **not** auto-start the
-video stream — click `Start stream` only after the drone service is ready. The
-MJPEG stream is throttled (default one frame per second) so camera requests do
-not flood the same command path used for flight control:
+controls, and Gemini Live event feed. To keep the drone's shared Wi-Fi link free
+for flight control, the flight buttons (`Connect`, `Take off`, movement) never
+start video. Only `Start stream` or `Snapshot` opens the camera view, and the
+view stops pulling frames on `shutdown`. The MJPEG stream is throttled (default
+one frame per second) so camera requests do not flood the same command path used
+for flight control:
 
 ```bash
 STREAM_FRAME_INTERVAL_SECONDS=1.0 python3 web_server.py
@@ -287,6 +289,11 @@ test the worker path directly with `drone_takeoff`.
 **Separate flight and video channels.** `takeoff` and movement use only the
 Tello command channel; they do not send `streamon`. Video starts lazily only
 when `snapshot`, `frame`, or the dashboard stream first requests a camera frame.
+The video stream also stops itself once no frame has been requested for a few
+seconds (`STREAM_IDLE_TIMEOUT_SECONDS`, default 5), so the drone's shared Wi-Fi
+radio stays free for voice control and explore mode between observations. The
+next frame request restarts the stream lazily. Voice control and explore mode
+are the primary features; the dashboard is a lightweight observation surface.
 
 **Keepalive prevents auto-land.** The Tello firmware auto-lands if it receives no
 command for about 15 seconds. After a successful `takeoff`, the service runs a
@@ -400,6 +407,7 @@ python gemini_live_computer_use.py --program ./my_worker.py
 | `DRONE_SERVICE_PORT` | `8765` | worker | Drone service port. |
 | `DRONE_SERVICE_TIMEOUT_SECONDS` | `30` | worker | Socket timeout for service calls. |
 | `STREAM_FRAME_INTERVAL_SECONDS` | `1.0` | web server | MJPEG stream throttle. |
+| `STREAM_IDLE_TIMEOUT_SECONDS` | `5` | drone service | Stop video when no frame requested this long (must exceed the stream interval). |
 | `DUPLICATE_DRONE_COMMAND_SECONDS` | `8` | Live client | Duplicate-command cooldown. |
 | `GEMINI_LIVE_EVENT_LOG` | `.gemini_live_events.jsonl` | Live client, web server | Shared event log path. |
 | `GEMINI_VISION_MODEL` | `gemini-2.5-flash` | worker | Model for vision summaries. |

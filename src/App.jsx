@@ -69,9 +69,17 @@ function App() {
     if (['land', 'shutdown'].includes(command)) {
       setPollDrone(false)
     }
-    if (['connect', 'takeoff', 'snapshot'].includes(command)) {
+    // Only an explicit camera action opens the live view. Connect/takeoff must
+    // not force the Tello to stream video, because video shares the drone's
+    // weak Wi-Fi link with flight control and would compete with commands and
+    // the keepalive heartbeat throughout the flight.
+    if (command === 'snapshot') {
       setStreamEnabled(true)
       setStreamKey((value) => value + 1)
+    }
+    // Stop pulling frames once the service connection is being torn down.
+    if (command === 'shutdown') {
+      setStreamEnabled(false)
     }
   }
 

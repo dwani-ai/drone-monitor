@@ -40,6 +40,11 @@ TURN_RC_SECONDS = float(os.getenv("TELLO_TURN_RC_SECONDS", "0.25"))
 # Send a heartbeat well under that window while airborne so the drone does not
 # land itself during the quiet gaps between voice commands.
 KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("TELLO_KEEPALIVE_SECONDS", "5"))
+# Stop the video stream when no frame has been requested recently. Video shares
+# the Tello's weak Wi-Fi link with flight control, so keeping it off between
+# observations frees the radio for voice control and explore mode. Must be
+# larger than the dashboard's STREAM_FRAME_INTERVAL_SECONDS or the stream flaps.
+STREAM_IDLE_TIMEOUT_SECONDS = float(os.getenv("STREAM_IDLE_TIMEOUT_SECONDS", "5"))
 REPO_ROOT = Path(__file__).resolve().parent
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
 
@@ -54,6 +59,9 @@ class DroneController:
         self.command_sequence = 0
         self._keepalive_stop = threading.Event()
         self._keepalive_thread: threading.Thread | None = None
+        self._last_frame_request = 0.0
+        self._stream_monitor_stop = threading.Event()
+        self._stream_monitor_thread: threading.Thread | None = None
 
     def _start_keepalive(self) -> None:
         """Begin sending periodic heartbeats so the Tello does not auto-land."""
@@ -89,6 +97,54 @@ class DroneController:
                 except Exception as exc:
                     print(f"Warning: keepalive failed: {exc}")
 
+    def _start_stream_monitor(self) -> None:
+        """Run a watcher that stops the video stream once it goes idle."""
+        self._stream_monitor_stop.clear()
+        if (
+            self._stream_monitor_thread is not None
+            and self._stream_monitor_thread.is_alive()
+        ):
+            return
+
+        self._stream_monitor_thread = threading.Thread(
+            target=self._stream_monitor_loop,
+            name="tello-stream-monitor",
+            daemon=True,
+        )
+        self._stream_monitor_thread.start()
+
+    def _stop_stream_monitor(self) -> None:
+        self._stream_monitor_stop.set()
+
+    def _stream_monitor_loop(self) -> None:
+        while not self._stream_monitor_stop.wait(1.0):
+            self._maybe_idle_streamoff()
+
+    def _maybe_idle_streamoff(self) -> None:
+        """Turn the video stream off if no frame has been requested recently."""
+        if not self.stream_started:
+            return
+        if time.monotonic() - self._last_frame_request < STREAM_IDLE_TIMEOUT_SECONDS:
+            return
+
+        with self.lock:
+            # Re-check under the lock in case a frame arrived while we waited.
+            if not self.stream_started or self.drone is None:
+                return
+            if (
+                time.monotonic() - self._last_frame_request
+                < STREAM_IDLE_TIMEOUT_SECONDS
+            ):
+                return
+            try:
+                self.drone.streamoff()
+            except Exception as exc:
+                print(f"Warning: idle streamoff failed: {exc}")
+                return
+            self.stream_started = False
+            self.drone.stream_on = False
+            print("Video stream stopped (idle); radio freed for flight control.")
+
     def _ensure_connected(self) -> Tello:
         if self.drone is None:
             self.drone = Tello(host=TELLO_HOST, retry_count=TELLO_RETRY_COUNT)
@@ -110,9 +166,13 @@ class DroneController:
 
     def _ensure_stream(self) -> Tello:
         drone = self._ensure_connected()
+        # Mark frame activity so the idle monitor keeps the stream alive while
+        # frames are actually being pulled (dashboard view, snapshot, explore).
+        self._last_frame_request = time.monotonic()
         if not self.stream_started:
             drone.streamon()
             self.stream_started = True
+            self._start_stream_monitor()
             time.sleep(2)
 
         return drone
@@ -455,6 +515,7 @@ class DroneController:
 
     def close(self) -> None:
         self._stop_keepalive()
+        self._stop_stream_monitor()
         if self.drone is None:
             return
 
