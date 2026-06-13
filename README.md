@@ -321,6 +321,30 @@ Gemini captures the current view, suggests exactly one safe next action, and ask
 for confirmation before moving. If you confirm, it executes only that one 5 cm
 move or 15 degree turn.
 
+**Audience-safe explore.** Explore is the most autonomous feature, so it has
+several guardrails layered for a live audience:
+
+- *Suggest, never auto-move.* The `explore` action only returns an observation
+  and one suggested action; it does not move. The drone moves only after you
+  explicitly confirm, and then only that single tiny step.
+- *Audience-safe action set.* With `DRONE_EXPLORE_SAFE_MODE` on (default), the
+  only actions explore can suggest are `turn_left`, `turn_right`, `up`, `down`,
+  and `stop`. Horizontal translation (`forward`/`back`/`left`/`right`) is never
+  suggested, so the drone cannot be guided toward the people watching. The drone
+  surveys the room by rotating in place. This is enforced server-side: any
+  out-of-set suggestion is forced to `stop`.
+- *People-aware vision.* The vision prompt must suggest `stop` if it sees any
+  person, face, hand, or body, if the path is not clearly open, if anything is
+  close, if the scene is dark or unclear, or if it is unsure.
+- *Battery floor.* Below `DRONE_EXPLORE_MIN_BATTERY_PERCENT` (default 15) explore
+  refuses to suggest a move and recommends landing.
+- *Tiny, slow movements.* Every confirmed step is a single 5 cm pulse or 15
+  degree turn at low RC velocity, with `stop` sent immediately after.
+
+For an empty room you can allow full movement with
+`DRONE_EXPLORE_SAFE_MODE=0`. Always keep a clear space, propeller guards, and be
+ready to say `Stop` (sends zero RC velocity immediately) or `Land`.
+
 **Duplicate suppression.** Accidental repeated drone actions are ignored for a
 short cooldown so Gemini does not loop on the same command. High-impact actions
 (`takeoff`, `land`, `snapshot`, `explore`, `shutdown`) use a longer window
@@ -418,6 +442,8 @@ python gemini_live_computer_use.py --program ./my_worker.py
 | `MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS` | `1.0` | Live client | Duplicate cooldown for repeatable movement/turn commands. |
 | `GEMINI_LIVE_EVENT_LOG` | `.gemini_live_events.jsonl` | Live client, web server | Shared event log path. |
 | `GEMINI_VISION_MODEL` | `gemini-2.5-flash` | worker | Model for vision summaries. |
+| `DRONE_EXPLORE_SAFE_MODE` | `1` (on) | worker | Limit explore suggestions to rotate/vertical/stop (no translation toward people). |
+| `DRONE_EXPLORE_MIN_BATTERY_PERCENT` | `15` | worker | Below this, explore recommends landing instead of moving. |
 | `COMPUTER_USE_HEADLESS` | auto | worker | Force headless/visible browser. |
 
 The dashboard and Live client must agree on `GEMINI_LIVE_EVENT_LOG`; override it

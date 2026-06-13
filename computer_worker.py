@@ -79,6 +79,25 @@ EXPLORE_ACTIONS = {
 }
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Audience-safe explore mode. When on (default), the explore suggestion is
+# limited to rotating in place, gentle vertical moves, or stop. Horizontal
+# translation (forward/back/left/right) is never suggested, so the drone cannot
+# be guided into the people watching the demo. Turn the guardrail off only for
+# an empty room.
+EXPLORE_SAFE_MODE = _env_flag("DRONE_EXPLORE_SAFE_MODE", True)
+EXPLORE_SAFE_ACTIONS = {"turn_left", "turn_right", "up", "down", "stop"}
+# Below this battery level, explore refuses to suggest a move and recommends
+# landing instead.
+EXPLORE_MIN_BATTERY_PERCENT = int(os.getenv("DRONE_EXPLORE_MIN_BATTERY_PERCENT", "15"))
+
+
 def parse_payload(payload: str) -> dict[str, Any]:
     """Accept either JSON payloads or plain text payloads."""
     if not payload:
@@ -414,16 +433,31 @@ def analyze_exploration_step(image_path: Path, telemetry: dict[str, Any]) -> dic
     """Ask Gemini for one safe next exploration action without executing it."""
     from google.genai import types
 
+    allowed_actions = EXPLORE_SAFE_ACTIONS if EXPLORE_SAFE_MODE else EXPLORE_ACTIONS
+    allowed_list = ", ".join(sorted(allowed_actions))
+
     client = create_genai_client()
+    safe_mode_rules = (
+        "This is a LIVE DEMO with people nearby, so audience safety is the top "
+        "priority. Only suggest rotating in place, a gentle vertical move, or "
+        "stop; never suggest moving horizontally, because the drone must not move "
+        "toward the people watching. "
+        if EXPLORE_SAFE_MODE
+        else ""
+    )
     prompt = (
         "You are guiding a small indoor Tello drone using very small movements. "
+        f"{safe_mode_rules}"
         "Look at the current camera frame and suggest exactly one safe next action. "
-        "Allowed actions are: forward, back, left, right, up, down, turn_left, "
-        "turn_right, stop. Translational actions are one 5 cm increment. Turns are "
-        "one 15 degree increment. Prefer stop if the scene is too dark, too close "
-        "to obstacles, unclear, or unsafe. Return only compact JSON with keys: "
-        "observation, suggested_action, reason. Telemetry: "
-        f"{json.dumps(telemetry, default=str)}"
+        f"Allowed actions are: {allowed_list}. Turns are one 15 degree increment; "
+        "up and down are one 5 cm increment. "
+        "You MUST suggest stop if you see any person, face, hand, or body, if the "
+        "path ahead is not clearly open, if anything is close, if the scene is "
+        "dark, blurry, or unclear, or if you are unsure for any reason. Never "
+        "suggest moving toward a person or an obstacle. When in doubt, suggest "
+        "stop. Return only compact JSON with keys: observation, suggested_action, "
+        "reason. "
+        f"Telemetry: {json.dumps(telemetry, default=str)}"
     )
     response = client.models.generate_content(
         model=VISION_MODEL_ID,
@@ -438,13 +472,17 @@ def analyze_exploration_step(image_path: Path, telemetry: dict[str, Any]) -> dic
 
     parsed = parse_json_object(text)
     suggested_action = str(parsed.get("suggested_action", "stop")).strip()
-    if suggested_action not in EXPLORE_ACTIONS:
+    # Hard guardrail: anything outside the active allow-list (including a
+    # horizontal move the model proposed in safe mode) is forced to stop.
+    if suggested_action not in allowed_actions:
         suggested_action = "stop"
 
     return {
         "observation": " ".join(str(parsed.get("observation", "")).split()),
         "suggested_action": suggested_action,
         "reason": " ".join(str(parsed.get("reason", "")).split()),
+        "safe_mode": EXPLORE_SAFE_MODE,
+        "allowed_actions": sorted(allowed_actions),
         "raw_response": text,
     }
 
@@ -589,8 +627,29 @@ def run_drone_explore(payload: str) -> dict[str, Any]:
             "drone_service_result": result,
         }
 
+    drone_info = dict(result.get("drone") or {})
+    battery = drone_info.get("battery_percent")
+    if isinstance(battery, (int, float)) and battery < EXPLORE_MIN_BATTERY_PERCENT:
+        return {
+            **result,
+            "exploration": {
+                "observation": "",
+                "suggested_action": "stop",
+                "reason": f"Battery is low ({battery}%).",
+                "safe_mode": EXPLORE_SAFE_MODE,
+            },
+            "message": (
+                f"Battery is low at {battery}%. Holding position and recommending "
+                "landing instead of exploring further."
+            ),
+            "spoken_message": (
+                f"Battery is low at {battery} percent. I suggest we stop and land "
+                "soon. Should I land?"
+            ),
+        }
+
     try:
-        analysis = analyze_exploration_step(image_path, dict(result.get("drone") or {}))
+        analysis = analyze_exploration_step(image_path, drone_info)
     except Exception as exc:
         return {
             "status": "error",
