@@ -83,9 +83,13 @@ python3 computer_worker.py --command drone_land
 ```
 
 The React `Take off` button and the Gemini Live voice command both go through
-the same long-lived `drone_service.py` path. If the button works but voice does
-not, restart `gemini_live_computer_use.py` so it picks up the latest tool
-instructions, then test the worker path directly with `drone_takeoff`.
+the same long-lived `drone_service.py` path. Gemini Live uses a dedicated
+`drone_control` tool with a small action list: `connect`, `status`, `takeoff`,
+`snapshot`, `land`, and `shutdown`. This keeps drone control separate from the
+generic browser/computer tool and avoids legacy commands during the live demo.
+If the button works but voice does not, restart `gemini_live_computer_use.py` so
+it picks up the latest tool instructions, then test the worker path directly
+with `drone_takeoff`.
 
 `drone_snapshot` captures one current Tello camera frame through the service,
 saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a

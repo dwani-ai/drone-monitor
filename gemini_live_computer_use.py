@@ -245,13 +245,14 @@ def list_live_models(args: argparse.Namespace) -> None:
 
 
 def build_live_config(enable_tools: bool) -> dict[str, Any]:
-    """Build the Gemini Live config with an explicit function declaration."""
+    """Build the Gemini Live config with explicit function declarations."""
     run_program_declaration = {
         "name": "run_computer_program",
         "description": (
             "Run an allowlisted command in a separate local Python program. "
-            "Use this for computer actions, browser actions, drone helper actions, "
-            "or local checks. Browser payloads should be JSON strings."
+            "Use this only for computer actions, browser actions, or local checks. "
+            "Browser payloads should be JSON strings. Do not use this for drone "
+            "flight control."
         ),
         "parameters": {
             "type": "object",
@@ -268,22 +269,12 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "browser_click_text",
                         "browser_type_text",
                         "browser_screenshot",
-                        "drone_connect",
-                        "drone_status",
-                        "drone_takeoff",
-                        "drone_snapshot",
-                        "drone_land",
-                        "drone_shutdown",
-                        "drone_run_simple",
-                        "drone_look_around",
                     ],
                     "description": (
                         "Worker command to run. Supported commands are status, echo, "
                         "list_repo_files, browser_open_url, browser_search, "
                         "browser_get_text, browser_click_text, browser_type_text, "
-                        "browser_screenshot, drone_connect, drone_status, "
-                        "drone_takeoff, drone_snapshot, drone_land, drone_shutdown, "
-                        "drone_run_simple, and drone_look_around."
+                        "and browser_screenshot."
                     ),
                 },
                 "payload": {
@@ -294,14 +285,48 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "{\"query\":\"drone safety checklist\"}, "
                         "{\"text\":\"More details\"}, or "
                         "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
-                        "\"submit\":true}. For drone_run_simple, optional JSON is "
-                        "{\"timeout_seconds\":60}. For drone_look_around, optional "
-                        "JSON is {\"timeout_seconds\":120}. For drone_snapshot, "
-                        "optional JSON is {\"settle_seconds\":0.2}."
+                        "\"submit\":true}."
                     ),
                 },
             },
             "required": ["command"],
+        },
+    }
+    drone_control_declaration = {
+        "name": "drone_control",
+        "description": (
+            "Control the live Tello drone service using a small safe action set. "
+            "Use this for all drone flight, telemetry, and current-view requests."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "connect",
+                        "status",
+                        "takeoff",
+                        "snapshot",
+                        "land",
+                        "shutdown",
+                    ],
+                    "description": (
+                        "Drone action. connect checks the service/drone connection; "
+                        "status reads telemetry; takeoff starts flight; snapshot "
+                        "captures and summarizes the current camera view; land lands "
+                        "the drone; shutdown closes the drone service connection."
+                    ),
+                },
+                "settle_seconds": {
+                    "type": "number",
+                    "description": (
+                        "Optional snapshot delay before reading the camera frame. "
+                        "Only relevant for action=snapshot; default is 0.2."
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     }
 
@@ -313,29 +338,27 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "call run_computer_program instead of claiming you did it. "
             "For browser requests, use the browser_* worker commands with JSON "
             "payloads. Do not request arbitrary shell commands. "
-            "For a real-time drone demo, use drone_status for battery/height, "
-            "drone_takeoff to start flying, and drone_land when the user asks "
-            "to land. If the user says take off, start, lift off, or fly, call "
-            "drone_takeoff exactly once and do not call any vision command in "
-            "the same turn. Use drone_snapshot when the user asks 'what do you "
-            "see?', 'what can you see?', 'look', 'look around', or asks for "
-            "the current view. drone_snapshot returns a one-line vision "
-            "summary; speak that summary directly. "
-            "When the user asks to run the drone simple program or simple.py, "
-            "call run_computer_program with command drone_run_simple. "
-            "During the live demo, do not use drone_look_around while "
-            "drone_service.py is running. Only use drone_look_around when the "
-            "user specifically asks for a legacy 360-degree scan, panorama, "
-            "or four-photo scan after the live drone service has been stopped. "
-            "When drone_look_around returns, "
-            "then speak the returned one-line summary directly. "
+            "For every drone request, use the drone_control tool. Never use "
+            "run_computer_program for drone control. If the user says take off, "
+            "start, lift off, or fly, call drone_control with action=takeoff "
+            "exactly once, then report the result. Do not also call snapshot in "
+            "the same turn. If the user asks for battery, height, telemetry, or "
+            "drone status, call drone_control with action=status. If the user asks "
+            "'what do you see?', 'what can you see?', 'look', 'look around', or "
+            "asks for the current view, call drone_control with action=snapshot "
+            "and speak the returned one-line summary directly. If the user asks "
+            "to land, call drone_control with action=land exactly once. "
+            "Do not run legacy 360-degree scan programs during the live demo; "
+            "explain that live snapshot is available instead. "
             "Keep spoken responses short and confirm tool results clearly. "
             "After each tool result, continue listening for the user's next request."
         ),
     }
 
     if enable_tools:
-        config["tools"] = [{"function_declarations": [run_program_declaration]}]
+        config["tools"] = [
+            {"function_declarations": [run_program_declaration, drone_control_declaration]}
+        ]
 
     return config
 
@@ -414,22 +437,39 @@ async def receive_live_messages(
                 function_responses = []
                 for function_call in tool_call.function_calls:
                     args = dict(function_call.args or {})
+                    tool_name = function_call.name
                     command = str(args.get("command", "status"))
                     payload = str(args.get("payload", ""))
+                    if tool_name == "drone_control":
+                        action = str(args.get("action", "status"))
+                        command = f"drone_{action}"
+                        payload_data: dict[str, Any] = {}
+                        if action == "snapshot" and "settle_seconds" in args:
+                            payload_data["settle_seconds"] = args["settle_seconds"]
+                        payload = json.dumps(payload_data)
+
                     print(f"\nTool call: {function_call.name}({args})")
                     append_live_event(
                         {
                             "type": "tool_call",
-                            "name": function_call.name,
+                            "name": tool_name,
                             "command": command,
                             "args": args,
                         }
                     )
 
-                    if function_call.name != "run_computer_program":
+                    if tool_name == "run_computer_program" and command.startswith("drone_"):
                         result = {
                             "status": "error",
-                            "message": f"Unknown tool: {function_call.name}",
+                            "message": (
+                                "Drone commands must use the drone_control tool, not "
+                                "run_computer_program."
+                            ),
+                        }
+                    elif tool_name not in {"run_computer_program", "drone_control"}:
+                        result = {
+                            "status": "error",
+                            "message": f"Unknown tool: {tool_name}",
                         }
                     else:
                         result = run_computer_program(
@@ -444,14 +484,14 @@ async def receive_live_messages(
                     append_live_event(
                         {
                             "type": "tool_result",
-                            "name": function_call.name,
+                            "name": tool_name,
                             "command": command,
                             "result": result,
                         }
                     )
                     function_responses.append(
                         {
-                            "name": function_call.name,
+                            "name": tool_name,
                             "id": function_call.id,
                             "response": {"result": result},
                         }
