@@ -37,11 +37,14 @@ EVENT_LOG_PATH = Path(
 DUPLICATE_DRONE_COMMAND_SECONDS = float(
     os.getenv("DUPLICATE_DRONE_COMMAND_SECONDS", "8")
 )
-PROTECTED_DRONE_COMMANDS = {
-    "drone_takeoff",
-    "drone_snapshot",
-    "drone_explore",
-    "drone_land",
+# Movement/turn commands are meant to be repeated ("turn right" again and again),
+# so they use a much shorter window than takeoff/land/snapshot. It only needs to
+# be long enough to drop accidental duplicate tool calls within a single turn,
+# not to block the next intentional nudge.
+MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS = float(
+    os.getenv("MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS", "1.0")
+)
+MOVEMENT_DRONE_COMMANDS = {
     "drone_forward",
     "drone_back",
     "drone_left",
@@ -51,8 +54,22 @@ PROTECTED_DRONE_COMMANDS = {
     "drone_turn_left",
     "drone_turn_right",
     "drone_stop",
-    "drone_shutdown",
 }
+PROTECTED_DRONE_COMMANDS = {
+    "drone_takeoff",
+    "drone_snapshot",
+    "drone_explore",
+    "drone_land",
+    "drone_shutdown",
+    *MOVEMENT_DRONE_COMMANDS,
+}
+
+
+def duplicate_window_seconds(command: str) -> float:
+    """Cooldown a repeated drone command is suppressed within."""
+    if command in MOVEMENT_DRONE_COMMANDS:
+        return MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS
+    return DUPLICATE_DRONE_COMMAND_SECONDS
 # Pure-flight/telemetry commands have no vision or browser work, so we can talk
 # to the long-lived drone service in-process instead of spawning a worker
 # subprocess per command. This trims process-startup latency from the most
@@ -658,7 +675,7 @@ async def receive_live_messages(
                     elif command in PROTECTED_DRONE_COMMANDS:
                         now = time.monotonic()
                         previous = recent_drone_commands.get(command)
-                        if previous and now - previous[0] < DUPLICATE_DRONE_COMMAND_SECONDS:
+                        if previous and now - previous[0] < duplicate_window_seconds(command):
                             result = duplicate_drone_result(
                                 command=command,
                                 cached_result=previous[1],

@@ -322,10 +322,16 @@ for confirmation before moving. If you confirm, it executes only that one 5 cm
 move or 15 degree turn.
 
 **Duplicate suppression.** Accidental repeated drone actions are ignored for a
-short cooldown (default 8 seconds) so Gemini does not loop on the same command:
+short cooldown so Gemini does not loop on the same command. High-impact actions
+(`takeoff`, `land`, `snapshot`, `explore`, `shutdown`) use a longer window
+(default 8 seconds). Movement and turn commands are meant to be repeated, so they
+use a much shorter window (default 1 second) — saying "turn right" several times
+in a row keeps turning instead of being suppressed:
 
 ```bash
-DUPLICATE_DRONE_COMMAND_SECONDS=8 python3 gemini_live_computer_use.py --vertexai
+DUPLICATE_DRONE_COMMAND_SECONDS=8 \
+MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS=1.0 \
+python3 gemini_live_computer_use.py --vertexai
 ```
 
 **Landing confirmation.** Gemini cannot land on the first request — it must ask
@@ -408,7 +414,8 @@ python gemini_live_computer_use.py --program ./my_worker.py
 | `DRONE_SERVICE_TIMEOUT_SECONDS` | `30` | worker | Socket timeout for service calls. |
 | `STREAM_FRAME_INTERVAL_SECONDS` | `1.0` | web server | MJPEG stream throttle. |
 | `STREAM_IDLE_TIMEOUT_SECONDS` | `5` | drone service | Stop video when no frame requested this long (must exceed the stream interval). |
-| `DUPLICATE_DRONE_COMMAND_SECONDS` | `8` | Live client | Duplicate-command cooldown. |
+| `DUPLICATE_DRONE_COMMAND_SECONDS` | `8` | Live client | Duplicate cooldown for high-impact actions (takeoff/land/snapshot/explore/shutdown). |
+| `MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS` | `1.0` | Live client | Duplicate cooldown for repeatable movement/turn commands. |
 | `GEMINI_LIVE_EVENT_LOG` | `.gemini_live_events.jsonl` | Live client, web server | Shared event log path. |
 | `GEMINI_VISION_MODEL` | `gemini-2.5-flash` | worker | Model for vision summaries. |
 | `COMPUTER_USE_HEADLESS` | auto | worker | Force headless/visible browser. |
