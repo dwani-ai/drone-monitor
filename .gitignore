@@ -185,3 +185,8 @@ cython_debug/
 # Drone camera captures
 tello_photo_*_deg.jpg
 drone_captures/
+.gemini_live_events.jsonl
+
+# React dashboard
+node_modules/
+dist/

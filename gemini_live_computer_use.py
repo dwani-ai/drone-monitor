@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,28 @@ OUTPUT_SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_DTYPE = "int16"
 CHUNK_SIZE = 1024
+DEFAULT_EVENT_LOG_PATH = Path(__file__).resolve().parent / ".gemini_live_events.jsonl"
+EVENT_LOG_PATH = Path(
+    os.getenv("GEMINI_LIVE_EVENT_LOG", str(DEFAULT_EVENT_LOG_PATH))
+).expanduser()
+
+
+def append_live_event(event: dict[str, Any]) -> None:
+    """Append one dashboard-readable Gemini Live event."""
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    try:
+        EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with EVENT_LOG_PATH.open("a", encoding="utf-8") as event_file:
+            event_file.write(json.dumps(payload, default=str) + "\n")
+    except OSError as exc:
+        print(f"Could not write Gemini Live event log: {exc}", file=sys.stderr)
+
+
+def is_normal_connection_close(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "ConnectionClosedOK" or "1000 None" in str(exc)
 
 
 def load_sounddevice() -> Any:
@@ -235,11 +258,32 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "properties": {
                 "command": {
                     "type": "string",
+                    "enum": [
+                        "status",
+                        "echo",
+                        "list_repo_files",
+                        "browser_open_url",
+                        "browser_search",
+                        "browser_get_text",
+                        "browser_click_text",
+                        "browser_type_text",
+                        "browser_screenshot",
+                        "drone_connect",
+                        "drone_status",
+                        "drone_takeoff",
+                        "drone_snapshot",
+                        "drone_land",
+                        "drone_shutdown",
+                        "drone_run_simple",
+                        "drone_look_around",
+                    ],
                     "description": (
                         "Worker command to run. Supported commands are status, echo, "
                         "list_repo_files, browser_open_url, browser_search, "
                         "browser_get_text, browser_click_text, browser_type_text, "
-                        "browser_screenshot, drone_run_simple, and drone_look_around."
+                        "browser_screenshot, drone_connect, drone_status, "
+                        "drone_takeoff, drone_snapshot, drone_land, drone_shutdown, "
+                        "drone_run_simple, and drone_look_around."
                     ),
                 },
                 "payload": {
@@ -252,7 +296,8 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
                         "{\"selector\":\"input[name=q]\",\"text\":\"tello drone\","
                         "\"submit\":true}. For drone_run_simple, optional JSON is "
                         "{\"timeout_seconds\":60}. For drone_look_around, optional "
-                        "JSON is {\"timeout_seconds\":120}."
+                        "JSON is {\"timeout_seconds\":120}. For drone_snapshot, "
+                        "optional JSON is {\"settle_seconds\":0.2}."
                     ),
                 },
             },
@@ -268,10 +313,18 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "call run_computer_program instead of claiming you did it. "
             "For browser requests, use the browser_* worker commands with JSON "
             "payloads. Do not request arbitrary shell commands. "
+            "For a real-time drone demo, use drone_status for battery/height, "
+            "drone_takeoff to start flying, drone_snapshot when the user asks "
+            "'what do you see?', 'what can you see?', 'look', 'look around', "
+            "or asks for the current view, and drone_land when the user asks "
+            "to land. drone_snapshot returns a one-line vision summary; speak "
+            "that summary directly. "
             "When the user asks to run the drone simple program or simple.py, "
             "call run_computer_program with command drone_run_simple. "
-            "When the user asks 'what do you see?' or asks the drone to look "
-            "around, call run_computer_program with command drone_look_around, "
+            "Only use drone_look_around when the user specifically asks for "
+            "a 360-degree scan, panorama, or four-photo scan, because it flies "
+            "a full capture sequence and lands at the end. "
+            "When drone_look_around returns, "
             "then speak the returned one-line summary directly. "
             "Keep spoken responses short and confirm tool results clearly. "
             "After each tool result, continue listening for the user's next request."
@@ -292,12 +345,17 @@ async def send_microphone_audio(
     """Forward microphone PCM chunks to Gemini Live."""
     while not stop_event.is_set():
         chunk = await audio_queue.get()
-        await session.send_realtime_input(
-            audio=types.Blob(
-                data=chunk,
-                mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+        try:
+            await session.send_realtime_input(
+                audio=types.Blob(
+                    data=chunk,
+                    mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
+                )
             )
-        )
+        except Exception as exc:
+            if stop_event.is_set() or is_normal_connection_close(exc):
+                return
+            raise
 
 
 async def play_model_audio(
@@ -313,7 +371,11 @@ async def play_model_audio(
     ) as stream:
         while not stop_event.is_set():
             chunk = await speaker_queue.get()
-            stream.write(chunk)
+            try:
+                stream.write(chunk)
+            except KeyboardInterrupt:
+                stop_event.set()
+                return
 
 
 async def receive_live_messages(
@@ -328,56 +390,82 @@ async def receive_live_messages(
     while not stop_event.is_set():
         saw_message = False
 
-        async for message in session.receive():
-            saw_message = True
-            if stop_event.is_set():
-                break
+        try:
+            receive_stream = session.receive()
+            async for message in receive_stream:
+                saw_message = True
+                if stop_event.is_set():
+                    break
 
-            if getattr(message, "data", None):
-                await speaker_queue.put(message.data)
+                if getattr(message, "data", None):
+                    await speaker_queue.put(message.data)
 
-            if getattr(message, "text", None):
-                print(message.text, end="", flush=True)
+                if getattr(message, "text", None):
+                    print(message.text, end="", flush=True)
+                    append_live_event({"type": "gemini_text", "text": message.text})
 
-            tool_call = getattr(message, "tool_call", None)
-            if not tool_call:
-                continue
+                tool_call = getattr(message, "tool_call", None)
+                if not tool_call:
+                    continue
 
-            function_responses = []
-            for function_call in tool_call.function_calls:
-                args = dict(function_call.args or {})
-                command = str(args.get("command", "status"))
-                payload = str(args.get("payload", ""))
-                print(f"\nTool call: {function_call.name}({args})")
-
-                if function_call.name != "run_computer_program":
-                    result = {
-                        "status": "error",
-                        "message": f"Unknown tool: {function_call.name}",
-                    }
-                else:
-                    result = run_computer_program(
-                        command=command,
-                        payload=payload,
-                        program_path=program_path,
-                        timeout_seconds=timeout_seconds,
-                        extra_env=worker_env,
+                function_responses = []
+                for function_call in tool_call.function_calls:
+                    args = dict(function_call.args or {})
+                    command = str(args.get("command", "status"))
+                    payload = str(args.get("payload", ""))
+                    print(f"\nTool call: {function_call.name}({args})")
+                    append_live_event(
+                        {
+                            "type": "tool_call",
+                            "name": function_call.name,
+                            "command": command,
+                            "args": args,
+                        }
                     )
 
-                print(f"Tool result: {json.dumps(result)}")
-                function_responses.append(
-                    {
-                        "name": function_call.name,
-                        "id": function_call.id,
-                        "response": {"result": result},
-                    }
-                )
+                    if function_call.name != "run_computer_program":
+                        result = {
+                            "status": "error",
+                            "message": f"Unknown tool: {function_call.name}",
+                        }
+                    else:
+                        result = run_computer_program(
+                            command=command,
+                            payload=payload,
+                            program_path=program_path,
+                            timeout_seconds=timeout_seconds,
+                            extra_env=worker_env,
+                        )
 
-            if function_responses:
-                await session.send_tool_response(function_responses=function_responses)
+                    print(f"Tool result: {json.dumps(result)}")
+                    append_live_event(
+                        {
+                            "type": "tool_result",
+                            "name": function_call.name,
+                            "command": command,
+                            "result": result,
+                        }
+                    )
+                    function_responses.append(
+                        {
+                            "name": function_call.name,
+                            "id": function_call.id,
+                            "response": {"result": result},
+                        }
+                    )
+
+                if function_responses:
+                    await session.send_tool_response(function_responses=function_responses)
+        except Exception as exc:
+            if stop_event.is_set() or is_normal_connection_close(exc):
+                return
+            raise
 
         if saw_message:
             print("\nGemini Live turn ended. Continuing to listen...", file=sys.stderr)
+            append_live_event(
+                {"type": "session", "message": "Gemini Live turn ended."}
+            )
         else:
             await asyncio.sleep(0.1)
 
@@ -402,8 +490,10 @@ async def run_live_client(args: argparse.Namespace) -> None:
         loop.call_soon_threadsafe(audio_queue.put_nowait, bytes(indata))
 
     print("Connecting to Gemini Live. Speak into your microphone.")
-    print("Try: 'Use the computer to check status' or 'Use the computer to echo hello'.")
+    print("Try: 'Take off', 'what do you see?', 'drone status', or 'land'.")
+    print(f"Dashboard event log: {EVENT_LOG_PATH}")
     print("Press Ctrl+C to stop.")
+    append_live_event({"type": "session", "message": "Connecting to Gemini Live."})
 
     with sd.RawInputStream(
         samplerate=INPUT_SAMPLE_RATE,
@@ -425,6 +515,13 @@ async def run_live_client(args: argparse.Namespace) -> None:
                     config=build_live_config(enable_tools=not args.disable_tools),
                 ) as session:
                     print("Connected. Listening for requests...")
+                    append_live_event(
+                        {
+                            "type": "session",
+                            "message": "Connected. Listening for requests.",
+                            "model": resolve_model(args),
+                        }
+                    )
 
                     tasks = [
                         asyncio.create_task(
@@ -454,13 +551,21 @@ async def run_live_client(args: argparse.Namespace) -> None:
                     await asyncio.gather(*pending, return_exceptions=True)
 
                     for task in done:
-                        task.result()
+                        try:
+                            task.result()
+                        except Exception as exc:
+                            if is_normal_connection_close(exc):
+                                continue
+                            raise
             except asyncio.CancelledError:
                 raise
             except errors.APIError:
                 raise
             except Exception as exc:
                 print(f"\nLive session ended: {exc}", file=sys.stderr)
+                append_live_event(
+                    {"type": "session", "message": f"Live session ended: {exc}"}
+                )
 
             print(f"Reconnecting in {reconnect_delay:.0f}s...", file=sys.stderr)
             await asyncio.sleep(reconnect_delay)

@@ -11,6 +11,8 @@ pip install -r requirements.txt
 
 python -m playwright install chromium
 
+npm install
+
 ## Gemini Live native audio
 
 For a Gemini Developer API key:
@@ -29,6 +31,65 @@ The Live client is interactive: it keeps listening after tool calls and
 reconnects automatically if the Live receive stream ends.
 The default worker timeout is 180 seconds so drone photo commands have time to
 take off, capture images, summarize them, and land.
+
+### Real-time drone demo
+
+For the fastest live demo, run a long-lived local drone service and the React
+dashboard. The service keeps the Tello connection and camera stream open across
+Gemini tool calls, so "what do you see?" can use the current camera frame
+without waiting for the drone to land.
+
+```bash
+python3 drone_service.py
+```
+
+In a second terminal, start the dashboard API:
+
+```bash
+python3 web_server.py
+```
+
+In a third terminal, start the React dashboard:
+
+```bash
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` to see the live drone camera stream, telemetry,
+flight controls, and Gemini Live event feed.
+
+Then start Gemini Live in another terminal:
+
+```bash
+python3 gemini_live_computer_use.py
+```
+
+Try saying:
+
+```text
+Take off.
+Drone status.
+What do you see?
+Land.
+```
+
+The real-time demo commands are:
+
+```bash
+python3 computer_worker.py --command drone_status
+python3 computer_worker.py --command drone_takeoff
+python3 computer_worker.py --command drone_snapshot
+python3 computer_worker.py --command drone_land
+```
+
+`drone_snapshot` captures one current Tello camera frame through the service,
+saves it under `drone_captures/<session-id>/`, and asks Gemini Vision for a
+short spoken summary. The older `drone_look_around` command still performs the
+full 360-degree capture sequence and lands at the end.
+
+The dashboard reads Gemini Live events from `.gemini_live_events.jsonl`. Override
+that path for both `gemini_live_computer_use.py` and `web_server.py` with
+`GEMINI_LIVE_EVENT_LOG=/path/to/events.jsonl` if needed.
 
 For Vertex AI, use Google Cloud application-default credentials. The Vertex AI
 Live endpoint does not accept API keys for these calls:
@@ -101,7 +162,10 @@ Use the browser to summarize the current page.
 Use the browser to take a screenshot.
 Run the drone simple program.
 Run simple.py on the drone.
+Take off.
+Drone status.
 What do you see?
+Land.
 Look around and tell me what you see.
 ```
 

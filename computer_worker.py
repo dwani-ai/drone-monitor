@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -28,6 +29,12 @@ SUPPORTED_COMMANDS = [
     "browser_click_text",
     "browser_type_text",
     "browser_screenshot",
+    "drone_connect",
+    "drone_status",
+    "drone_takeoff",
+    "drone_snapshot",
+    "drone_land",
+    "drone_shutdown",
     "drone_run_simple",
     "drone_look_around",
 ]
@@ -37,6 +44,8 @@ BROWSER_DIR = REPO_ROOT / ".computer_use_browser"
 STATE_PATH = BROWSER_DIR / "state.json"
 SCREENSHOT_PATH = BROWSER_DIR / "screenshot.png"
 DRONE_CAPTURE_DIR = REPO_ROOT / "drone_captures"
+DRONE_SERVICE_HOST = os.getenv("DRONE_SERVICE_HOST", "127.0.0.1")
+DRONE_SERVICE_PORT = int(os.getenv("DRONE_SERVICE_PORT", "8765"))
 SIMPLE_DRONE_PROGRAM = REPO_ROOT / "simple.py"
 PHOTO_DRONE_PROGRAM = REPO_ROOT / "360_photo.py"
 PHOTO_FILENAMES = [
@@ -323,6 +332,104 @@ def summarize_drone_photos(image_paths: list[Path]) -> str:
     return " ".join(summary.split())
 
 
+def summarize_drone_snapshot(image_path: Path) -> str:
+    """Ask Gemini for a short spoken summary of one live drone frame."""
+    from google.genai import types
+
+    client = create_genai_client()
+    response = client.models.generate_content(
+        model=VISION_MODEL_ID,
+        contents=[
+            (
+                "This is a current camera frame from a Tello drone. "
+                "In one short spoken sentence, answer: what do you see?"
+            ),
+            types.Part.from_bytes(data=image_path.read_bytes(), mime_type="image/jpeg"),
+        ],
+    )
+    summary = (response.text or "").strip()
+    if not summary:
+        raise RuntimeError("Gemini returned an empty image summary.")
+
+    return " ".join(summary.split())
+
+
+def call_drone_service(command: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send one JSON command to the long-lived local drone service."""
+    request = json.dumps({"command": command, "payload": payload}) + "\n"
+    try:
+        with socket.create_connection(
+            (DRONE_SERVICE_HOST, DRONE_SERVICE_PORT),
+            timeout=10,
+        ) as sock:
+            sock.sendall(request.encode("utf-8"))
+            response = sock.makefile("r", encoding="utf-8").readline()
+    except OSError as exc:
+        return {
+            "status": "error",
+            "message": (
+                f"Drone service is not reachable at "
+                f"{DRONE_SERVICE_HOST}:{DRONE_SERVICE_PORT}: {exc}. "
+                "Start it with: python drone_service.py"
+            ),
+        }
+
+    if not response:
+        return {"status": "error", "message": "Drone service returned no response."}
+
+    try:
+        parsed = json.loads(response)
+    except json.JSONDecodeError as exc:
+        return {
+            "status": "error",
+            "message": f"Drone service returned invalid JSON: {exc}",
+            "raw_response": response,
+        }
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    return {"status": "error", "message": "Drone service response was not an object."}
+
+
+def run_drone_service_command(command: str, payload: str) -> dict[str, Any]:
+    """Proxy a worker drone_* command to drone_service.py."""
+    data = parse_payload(payload)
+    service_command = command.removeprefix("drone_")
+    return call_drone_service(service_command, data)
+
+
+def run_drone_snapshot(payload: str) -> dict[str, Any]:
+    """Capture and summarize one current drone camera frame."""
+    data = parse_payload(payload)
+    result = call_drone_service("snapshot", data)
+    if result.get("status") != "ok":
+        return result
+
+    image_path = Path(str(result.get("image", "")))
+    if not image_path.exists():
+        return {
+            "status": "error",
+            "message": f"Drone snapshot image was not found: {image_path}",
+            "drone_service_result": result,
+        }
+
+    try:
+        summary = summarize_drone_snapshot(image_path)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to summarize drone snapshot: {exc}",
+            "image": str(image_path),
+            "drone_service_result": result,
+        }
+
+    return {
+        **result,
+        "summary": summary,
+    }
+
+
 def run_look_around(payload: str) -> dict[str, Any]:
     """Capture four drone photos with 360_photo.py and summarize them."""
     data = parse_payload(payload)
@@ -445,6 +552,18 @@ def handle_command(command: str, payload: str) -> dict[str, Any]:
 
     if command.startswith("browser_"):
         return run_browser_action(command, payload)
+
+    if command in {
+        "drone_connect",
+        "drone_status",
+        "drone_takeoff",
+        "drone_land",
+        "drone_shutdown",
+    }:
+        return run_drone_service_command(command, payload)
+
+    if command == "drone_snapshot":
+        return run_drone_snapshot(payload)
 
     if command == "drone_run_simple":
         return run_simple_drone_program(payload)
