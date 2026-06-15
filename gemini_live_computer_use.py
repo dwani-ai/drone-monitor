@@ -44,6 +44,11 @@ DUPLICATE_DRONE_COMMAND_SECONDS = float(
 MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS = float(
     os.getenv("MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS", "1.0")
 )
+# Status polls are cheap but Gemini can loop on them after landing; use a longer
+# cooldown than movement so repeated tool calls stay suppressed.
+STATUS_DUPLICATE_DRONE_COMMAND_SECONDS = float(
+    os.getenv("STATUS_DUPLICATE_DRONE_COMMAND_SECONDS", "15")
+)
 MOVEMENT_DRONE_COMMANDS = {
     "drone_forward",
     "drone_back",
@@ -57,6 +62,7 @@ MOVEMENT_DRONE_COMMANDS = {
 }
 PROTECTED_DRONE_COMMANDS = {
     "drone_takeoff",
+    "drone_status",
     "drone_snapshot",
     "drone_explore",
     "drone_land",
@@ -69,6 +75,8 @@ def duplicate_window_seconds(command: str) -> float:
     """Cooldown a repeated drone command is suppressed within."""
     if command in MOVEMENT_DRONE_COMMANDS:
         return MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS
+    if command == "drone_status":
+        return STATUS_DUPLICATE_DRONE_COMMAND_SECONDS
     return DUPLICATE_DRONE_COMMAND_SECONDS
 # Pure-flight/telemetry commands have no vision or browser work, so we can talk
 # to the long-lived drone service in-process instead of spawning a worker
@@ -118,6 +126,10 @@ def duplicate_drone_result(
     elapsed_seconds: float,
 ) -> dict[str, Any]:
     """Return a non-executing result for an accidental repeated drone action."""
+    if command == "drone_status":
+        spoken_message = "Status unchanged. Waiting for your next request."
+    else:
+        spoken_message = "Already handled. I did not send another drone command."
     return {
         "status": "ok",
         "duplicate_suppressed": True,
@@ -126,7 +138,7 @@ def duplicate_drone_result(
             f"Duplicate {command} ignored because it was requested "
             f"{elapsed_seconds:.1f}s ago. No drone command was sent."
         ),
-        "spoken_message": "Already handled. I did not send another drone command.",
+        "spoken_message": spoken_message,
         "previous_result": cached_result,
     }
 
@@ -473,6 +485,9 @@ def build_live_config(enable_tools: bool) -> dict[str, Any]:
             "to land, do not land immediately. Ask 'Confirm landing?' first. Only "
             "after the user explicitly says yes or confirms landing, call "
             "drone_control with action=land and confirmed_land=true exactly once. "
+            "After landing, report the result once and wait for the user's next "
+            "request. Do not poll status repeatedly unless the user asks for "
+            "battery, height, or telemetry. If status is unchanged, stay quiet. "
             "Do not run legacy 360-degree scan programs during the live demo; "
             "explain that live snapshot is available instead. "
             "For drone tool results, prefer the spoken_message field exactly. "
@@ -692,6 +707,20 @@ async def receive_live_messages(
                         flight_state["airborne"] = True
                     elif command == "drone_land" and result.get("status") == "ok":
                         flight_state["airborne"] = False
+                        # Land already returns telemetry; treat it as the latest
+                        # status snapshot so unprompted post-land polls are suppressed.
+                        if isinstance(result.get("drone"), dict):
+                            now = time.monotonic()
+                            recent_drone_commands["drone_status"] = (
+                                now,
+                                {
+                                    "status": "ok",
+                                    "drone": result["drone"],
+                                    "spoken_message": result.get(
+                                        "spoken_message", "Landed."
+                                    ),
+                                },
+                            )
 
                     print(f"Tool result: {json.dumps(result)}")
                     append_live_event(

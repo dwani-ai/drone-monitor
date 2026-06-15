@@ -348,12 +348,15 @@ ready to say `Stop` (sends zero RC velocity immediately) or `Land`.
 **Duplicate suppression.** Accidental repeated drone actions are ignored for a
 short cooldown so Gemini does not loop on the same command. High-impact actions
 (`takeoff`, `land`, `snapshot`, `explore`, `shutdown`) use a longer window
-(default 8 seconds). Movement and turn commands are meant to be repeated, so they
-use a much shorter window (default 1 second) — saying "turn right" several times
-in a row keeps turning instead of being suppressed:
+(default 8 seconds). Status polls use an even longer window (default 15 seconds)
+because Gemini can otherwise repeat telemetry after landing. Movement and turn
+commands are meant to be repeated, so they use a much shorter window (default 1
+second) — saying "turn right" several times in a row keeps turning instead of
+being suppressed:
 
 ```bash
 DUPLICATE_DRONE_COMMAND_SECONDS=8 \
+STATUS_DUPLICATE_DRONE_COMMAND_SECONDS=15 \
 MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS=1.0 \
 python3 gemini_live_computer_use.py --vertexai
 ```
@@ -439,6 +442,7 @@ python gemini_live_computer_use.py --program ./my_worker.py
 | `STREAM_FRAME_INTERVAL_SECONDS` | `1.0` | web server | MJPEG stream throttle. |
 | `STREAM_IDLE_TIMEOUT_SECONDS` | `5` | drone service | Stop video when no frame requested this long (must exceed the stream interval). |
 | `DUPLICATE_DRONE_COMMAND_SECONDS` | `8` | Live client | Duplicate cooldown for high-impact actions (takeoff/land/snapshot/explore/shutdown). |
+| `STATUS_DUPLICATE_DRONE_COMMAND_SECONDS` | `15` | Live client | Duplicate cooldown for status polls (prevents post-land telemetry loops). |
 | `MOVEMENT_DUPLICATE_DRONE_COMMAND_SECONDS` | `1.0` | Live client | Duplicate cooldown for repeatable movement/turn commands. |
 | `GEMINI_LIVE_EVENT_LOG` | `.gemini_live_events.jsonl` | Live client, web server | Shared event log path. |
 | `GEMINI_VISION_MODEL` | `gemini-2.5-flash` | worker | Model for vision summaries. |
